@@ -1,0 +1,498 @@
+# Databricks notebook source
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.window import *
+import pyspark
+import numpy as np
+from datetime import *
+
+# COMMAND ----------
+
+spark.conf.set("spark.sql.shuffle.partitions",sc.defaultParallelism*3)
+
+# COMMAND ----------
+
+week = 108
+
+# COMMAND ----------
+
+import os
+
+Scan_Data_File=[]
+pathlist = []
+pathlist.append("/mnt/ADLS_Refined/SalesDataFoundation/Scan/SEP_ScanData/Active/")
+
+fileName = "SEP_ScanData"
+fileCount = 0
+ScanDeltaFiles = []
+
+dbfs = "/dbfs"
+
+for sourceFilePath in pathlist:
+  ADLSPath = dbfs+sourceFilePath
+  for path, dirs, files in os.walk(ADLSPath):
+    for file in files:
+      if file.startswith(fileName):
+        abspath = os.path.join(path, file)
+        mountPath = abspath.replace(dbfs,"")
+        ScanDeltaFiles.append(mountPath)
+
+for file in range(-week, 0):
+  Scan_Data_File.append(ScanDeltaFiles[file])
+  fileCount += 1
+
+# COMMAND ----------
+
+# DBTITLE 1,Stars and Scan venue
+Stars_Venue = (spark.read.parquet("/mnt/ADLS_Reporting/IRI/Stars_Venue/ILD_Stars_Venue/*.parquet").select("ACCOUNTNUMBER","LOCATION_ZIP5").distinct().filter( (col("Location_Type_Cd") == 'RETAILSTORE') & (col("IS_OPEN_FOR_BUSINESS") == 'Y') & (col("IS_OPEN_IN_SYSTEM") == 'Y') & (col("IS_CALLEDON_STORE") == 'Y') & (col("Location_State_Short_Name").isin('MI','TN'))))
+
+Scan_Venue = (spark.read.parquet("/mnt/ADLS_Reporting/IRI/Scan_Venue/ILD_Scan_Venue/*.parquet").select("MatchedAccountNumber","Submitter","LOCATION_ZIP5").distinct().filter( (col("Location_Type_Cd") == 'RETAILSTORE') & (col("IS_OPEN_FOR_BUSINESS") == 'Y') & (col("IS_OPEN_IN_SYSTEM") == 'Y') & (col("IS_CALLEDON_STORE") == 'Y') & (col("Location_State_Short_Name").isin('MI','TN'))).withColumnRenamed("MatchedAccountNumber","MatchedAccountNumber_Scan").withColumnRenamed("Submitter","Submitter_Scan"))
+
+# COMMAND ----------
+
+# DBTITLE 1,Brand Master
+Msa_Brandmaster = spark.sql("select MSA_Brand_Cd,Brand_Family_Desc,Brand_Family_Cd,MSA_Category_Desc,MSA_Category_Cd,Sub_Brand_Cd from starsdata.msa_brandmaster")##subbrand family 
+
+# COMMAND ----------
+
+Stars_Venue.createOrReplaceTempView("Stars_Venue")
+Scan_Venue.createOrReplaceTempView("Scan_Venue")
+
+# COMMAND ----------
+
+# DBTITLE 1,Scan data
+SEP_ScanData = (
+   spark.read
+        .format("parquet")
+        .option("inferSchema", "True")
+        .option("header", "True")
+        .option("delimiter", "|")
+        .option("ignoreLeadingWhiteSpace","True")
+        .option("ignoreTrailingWhiteSpace","True")
+        .load(Scan_Data_File)
+        .withColumn("WeekEndDate",col("WeekEndDate").cast(DateType()))
+        .repartition(sc.defaultParallelism*3)
+        .join(broadcast(Msa_Brandmaster), Msa_Brandmaster.MSA_Brand_Cd == col("MaterialID"))
+        .join(broadcast(Scan_Venue), (Scan_Venue.MatchedAccountNumber_Scan == col("MatchedAccountNumber")) & (Scan_Venue.Submitter_Scan == col('Submitter')))
+        .filter(Msa_Brandmaster.Brand_Family_Cd == '327')#Marlboro Cig Filter
+        .select("MatchedAccountNumber","Submitter","WeekEndDate","MaterialID",to_date("TransactionDateTimeStamp").alias('TransactionDateTimeStamp'),"SalesAmount","SalesQtyAdjusted","TransactionID","Sub_Brand_Cd","IsProductPromo","LOCATION_ZIP5","IsMultiPack")
+        .groupBy("MatchedAccountNumber","Submitter","WeekEndDate","MaterialID","TransactionDateTimeStamp","TransactionID","Sub_Brand_Cd","IsProductPromo","LOCATION_ZIP5","IsMultiPack")
+        .agg(sum("SalesAmount").alias("SalesAmount"),sum("SalesQtyAdjusted").alias("SalesQtyAdjusted"))
+              ).persist(pyspark.StorageLevel.DISK_ONLY)
+
+# COMMAND ----------
+
+# DBTITLE 1,Max Weekend date
+Stars_MAX_Weekend = spark.sql("SELECT CAST(MAX(Week_End_Date) AS DATE) AS Weekenddate FROM catman.WeekEnding_Report").collect()[0][0]
+print(Stars_MAX_Weekend)
+
+# COMMAND ----------
+
+# DBTITLE 1,Sdf Shipment
+sep_sdf_shipments_data = spark.sql("select MSAReportedShipToAccountNumber AS Rc_Num,to_date(WeekEndDate) as WeekEndDate,Material_ID,ShipmentTypeCode,ShipQty from starsdata.SEP_SDF_Shipments_Data inner join Stars_Venue on Stars_Venue.ACCOUNTNUMBER == MSAReportedShipToAccountNumber where PRShipment = 0 and  WeekEndDate >= date_sub('{0}',116*7) and ShipmentTypeCode is not NULL and ShipmentTypeCode not in ('Z004','Z011','Z031','Z001') ".format(Stars_MAX_Weekend)).persist(pyspark.StorageLevel.DISK_ONLY)
+
+# COMMAND ----------
+
+# DBTITLE 1,Weekend date
+Stars_Last4wk = Stars_MAX_Weekend - timedelta(days=(3*7))
+Stars_Last13wk = Stars_MAX_Weekend - timedelta(days=(12*7))
+Stars_Last14wk = Stars_MAX_Weekend - timedelta(days=(13*7))
+Stars_Last26wk = Stars_MAX_Weekend - timedelta(days=(25*7))
+Stars_Last52wk = Stars_MAX_Weekend - timedelta(days=(51*7))
+Stars_Last104wk = Stars_MAX_Weekend - timedelta(days=(103*7))
+Stars_Last117wk = Stars_MAX_Weekend - timedelta(days=(116*7))
+print(Stars_Last4wk,"",Stars_Last13wk, "" ,Stars_Last26wk,"",Stars_Last52wk,"",Stars_Last14wk,"",Stars_Last104wk,"",Stars_Last117wk)
+
+# COMMAND ----------
+
+# DBTITLE 1,Generating 117 weeks date
+FiftyTwo_Weekenddate = Stars_Last52wk
+Max_WeekEndDate = Stars_MAX_Weekend
+date_range_df = spark.sql("SELECT sequence(to_date('{}'), to_date('{}'), interval 1 week) as WeekEndDate".format(Stars_Last117wk,Max_WeekEndDate))
+date_range_df = date_range_df.withColumn('WeekEndDate', explode('WeekEndDate'))
+date_range_df = date_range_df.withColumn('Ship_Qty', lit(0))
+
+# COMMAND ----------
+
+# DBTITLE 1,Assigning 117weeks to RC Num
+Stars_Rcnum_Dist = (sep_sdf_shipments_data.select(sep_sdf_shipments_data.Rc_Num).distinct())
+void_date = Stars_Rcnum_Dist.crossJoin(date_range_df).select(Stars_Rcnum_Dist.Rc_Num,date_range_df.WeekEndDate.alias("Week_End_Date"),date_range_df.Ship_Qty)
+
+# COMMAND ----------
+
+# DBTITLE 1,Stars Marlboro and Total Industry
+Stars_Volume_Stg1 = (sep_sdf_shipments_data.join(Msa_Brandmaster, Msa_Brandmaster.MSA_Brand_Cd == sep_sdf_shipments_data.Material_ID, "inner")
+                .join(Stars_Venue, Stars_Venue.ACCOUNTNUMBER == sep_sdf_shipments_data.Rc_Num,"inner")
+                .select(
+                  sep_sdf_shipments_data.Rc_Num,
+                  sep_sdf_shipments_data.WeekEndDate,
+                  when((Msa_Brandmaster.Brand_Family_Desc == 'Marlboro CIG'),(sep_sdf_shipments_data.ShipQty/200)).alias("Total_Marlboro_Cartons"),
+                  when((Msa_Brandmaster.MSA_Category_Cd == '3123'),(sep_sdf_shipments_data.ShipQty/200)).alias("Total_Industry_Cartons")
+                )
+                 .groupBy(sep_sdf_shipments_data.Rc_Num,sep_sdf_shipments_data.WeekEndDate)
+                .agg(sum("Total_Marlboro_Cartons").alias("Total_Marlboro_Cartons"), sum("Total_Industry_Cartons").alias("Total_Industry_Cartons"))
+               )
+
+# COMMAND ----------
+
+# DBTITLE 1,Calculate Missing Weeks for Stars
+Stars_Missing_weeks_Records = (void_date.join(Stars_Volume_Stg1,(void_date.Rc_Num == Stars_Volume_Stg1.Rc_Num) & (void_date.Week_End_Date == col('WeekEndDate')) ,"left_anti")
+                               .withColumn('Total_Marlboro_Cartons',lit('0').cast(DoubleType()))
+                               .withColumn('Total_Industry_Cartons',lit('0').cast(DoubleType()))
+                        ).drop('Ship_Qty')
+
+
+Stars_Volume_Stg = Stars_Volume_Stg1.union(Stars_Missing_weeks_Records)
+
+# COMMAND ----------
+
+# DBTITLE 1,Calculate stars rolling 13 & 4 Wk
+Stars_Volume_13_4_Wk = (Stars_Volume_Stg.select(Stars_Volume_Stg.Rc_Num,
+        Stars_Volume_Stg.WeekEndDate,
+        Stars_Volume_Stg.Total_Marlboro_Cartons,
+        Stars_Volume_Stg.Total_Industry_Cartons,
+        sum(Stars_Volume_Stg.Total_Marlboro_Cartons).over(Window.partitionBy(Stars_Volume_Stg.Rc_Num).orderBy(Stars_Volume_Stg.WeekEndDate.asc()).rowsBetween(-12, 0)).alias("Total_Marlboro_Cartons_13_Weeks"),
+        sum(Stars_Volume_Stg.Total_Industry_Cartons).over(Window.partitionBy(Stars_Volume_Stg.Rc_Num).orderBy(Stars_Volume_Stg.WeekEndDate.asc()).rowsBetween(-12, 0)).alias("Total_Industry_Cartons_13_Weeks"),
+        sum(Stars_Volume_Stg.Total_Marlboro_Cartons).over(Window.partitionBy(Stars_Volume_Stg.Rc_Num).orderBy(Stars_Volume_Stg.WeekEndDate.asc()).rowsBetween(-3, 0)).alias("Total_Marlboro_Cartons_4_Weeks"),
+        sum(Stars_Volume_Stg.Total_Industry_Cartons).over(Window.partitionBy(Stars_Volume_Stg.Rc_Num).orderBy(Stars_Volume_Stg.WeekEndDate.asc()).rowsBetween(-3, 0)).alias("Total_Industry_Cartons_4_Weeks")
+                               )
+       )
+
+# COMMAND ----------
+
+# %sql
+# SELECT * FROm Stars_Venue
+# WHERE ACCOUNTNUMBER = '105315'
+
+# COMMAND ----------
+
+# DBTITLE 1,Stars Local Market  Calculation 
+Stars_Mkt_Share_Stg1 = (sep_sdf_shipments_data.join(Msa_Brandmaster, Msa_Brandmaster.MSA_Brand_Cd == sep_sdf_shipments_data.Material_ID, "inner")
+                .join(Stars_Venue, Stars_Venue.ACCOUNTNUMBER == sep_sdf_shipments_data.Rc_Num,"inner")
+                   .filter((Msa_Brandmaster.Brand_Family_Desc == 'Marlboro CIG') )
+     .select( Stars_Venue.LOCATION_ZIP5,
+                  sep_sdf_shipments_data.WeekEndDate,
+             sep_sdf_shipments_data.ShipQty
+            ).groupby("LOCATION_ZIP5","WeekEndDate").agg(sum(sep_sdf_shipments_data.ShipQty/200).alias("Local_Market_Marlboro"))
+                  )
+
+Stars_Mkt_Share_Stg = (Stars_Mkt_Share_Stg1.join(Stars_Venue,Stars_Venue.LOCATION_ZIP5 == Stars_Mkt_Share_Stg1.LOCATION_ZIP5 ,'inner')
+                      # .select(col("ACCOUNTNUMBER").alias("Rc_Num")
+                        .select(col("ACCOUNTNUMBER").alias("Rc_Num"),
+                               Stars_Mkt_Share_Stg1.WeekEndDate,
+                               Stars_Mkt_Share_Stg1.Local_Market_Marlboro
+                               
+                              )
+                      )
+
+# COMMAND ----------
+
+# display(Stars_Mkt_Share_Stg1.filter((Stars_Mkt_Share_Stg1.LOCATION_ZIP5 == '37753') &(Stars_Mkt_Share_Stg1.WeekEndDate == '2019-02-16')))
+
+# COMMAND ----------
+
+# display(Stars_Mkt_Share_Stg.filter((Stars_Mkt_Share_Stg.Rc_Num == '105315') &(Stars_Mkt_Share_Stg.WeekEndDate == '2019-02-16')))
+
+# COMMAND ----------
+
+# DBTITLE 1,Generating Missing Weekend date for Local Market Calculation
+Stars_Missing_weeks_Records = (void_date.join(Stars_Mkt_Share_Stg,(void_date.Rc_Num == Stars_Mkt_Share_Stg.Rc_Num) & (void_date.Week_End_Date == col('WeekEndDate')) ,"left_anti")
+                               .withColumn('Local_Market_Marlboro',lit('0'))
+                        ).drop('Ship_Qty')
+
+Stars_Mkt_Share = Stars_Mkt_Share_Stg.union(Stars_Missing_weeks_Records)
+
+# COMMAND ----------
+
+# display(Stars_Mkt_Share.filter((Stars_Mkt_Share.Local_Market_Marlboro == '0')  | (Stars_Mkt_Share.Local_Market_Marlboro.isNull())))
+
+# COMMAND ----------
+
+# display(Stars_Mkt_Share.filter((Stars_Mkt_Share.Rc_Num == '843570') &(Stars_Mkt_Share.WeekEndDate == '2018-06-23')))
+
+# COMMAND ----------
+
+# DBTITLE 1,Calculating 4 wk moving for Local market
+Stars_Mkt_Share_4_Wk = (Stars_Mkt_Share.select(Stars_Mkt_Share.Rc_Num,
+        Stars_Mkt_Share.WeekEndDate,
+        Stars_Mkt_Share.Local_Market_Marlboro.alias("Total_Local_Market_Marlboro_Cartons"),
+        sum(Stars_Mkt_Share.Local_Market_Marlboro).over(Window.partitionBy(Stars_Mkt_Share.Rc_Num).orderBy(Stars_Mkt_Share.WeekEndDate.asc()).rowsBetween(-3, 0)).alias("Total_Local_Market_Marlboro_Cartons_4_Weeks"),
+                               )
+       )
+
+# COMMAND ----------
+
+# DBTITLE 1,Generating 52 weeks for Scan RC Num
+Scan_Rcnum_Dist = (SEP_ScanData.select(SEP_ScanData.MatchedAccountNumber).distinct())
+void_date = Scan_Rcnum_Dist.crossJoin(date_range_df).select(Scan_Rcnum_Dist.MatchedAccountNumber.alias("Rc_Num"),date_range_df.WeekEndDate.alias("Week_End_Date"),date_range_df.Ship_Qty)
+
+# COMMAND ----------
+
+# DBTITLE 1,Scan Volume calculation
+Scan_Volume_Stg = (SEP_ScanData
+                .join(broadcast(Scan_Venue), (Scan_Venue.MatchedAccountNumber_Scan == SEP_ScanData.MatchedAccountNumber) & (Scan_Venue.Submitter_Scan == SEP_ScanData.Submitter),"inner")
+                .select(
+                  SEP_ScanData.MatchedAccountNumber.alias("Rc_Num"),
+                  SEP_ScanData.WeekEndDate,
+                  SEP_ScanData.SalesQtyAdjusted.alias("Total_Marlboro_Packs"),
+                  concat(SEP_ScanData.TransactionDateTimeStamp,SEP_ScanData.TransactionID).alias("Total_Marlboro_Trips"),
+                  SEP_ScanData.SalesAmount
+                )
+                .groupBy("Rc_Num","WeekEndDate")
+                .agg(sum("Total_Marlboro_Packs").cast("decimal(18,4)").alias("Total_Marlboro_Packs"), countDistinct("Total_Marlboro_Trips").cast("decimal(18,4)").alias("Total_Marlboro_Trips"),sum("SalesAmount").cast("decimal(18,4)").alias("All_Marlboro_Dollar_Sales"))
+              )
+      
+
+# COMMAND ----------
+
+# DBTITLE 1,Generating Missing weeks to Scan volume
+Scan_Missing_weeks_Records = (void_date.join(Scan_Volume_Stg,(void_date.Rc_Num == Scan_Volume_Stg.Rc_Num) & (void_date.Week_End_Date == col('WeekEndDate')) ,"left_anti")
+                               .withColumn('Total_Marlboro_Packs',lit('0'))
+                               .withColumn('Total_Marlboro_Trips',lit('0'))
+                               .withColumn('All_Marlboro_Dollar_Sales',lit('0'))
+
+                        ).drop('Ship_Qty')
+
+Scan_Volume = Scan_Volume_Stg.union(Scan_Missing_weeks_Records)
+
+# COMMAND ----------
+
+# DBTITLE 1,Calculating Scan 4 wk
+Scan_Volume_4_Wk = (Scan_Volume.select(Scan_Volume.Rc_Num,
+        Scan_Volume.WeekEndDate,
+        Scan_Volume.Total_Marlboro_Packs,
+        Scan_Volume.Total_Marlboro_Trips,          
+        Scan_Volume.All_Marlboro_Dollar_Sales,       
+        sum(Scan_Volume.Total_Marlboro_Packs).over(Window.partitionBy(Scan_Volume.Rc_Num).orderBy(Scan_Volume.WeekEndDate.asc()).rowsBetween(-3, 0)).alias("Total_Marlboro_Packs_Last_4_Weeks"),
+        sum(Scan_Volume.Total_Marlboro_Trips).over(Window.partitionBy(Scan_Volume.Rc_Num).orderBy(Scan_Volume.WeekEndDate.asc()).rowsBetween(-3, 0)).alias("Total_Marlboro_Trips_Last_4_Weeks"),
+        sum(Scan_Volume.All_Marlboro_Dollar_Sales).over(Window.partitionBy(Scan_Volume.Rc_Num).orderBy(Scan_Volume.WeekEndDate.asc()).rowsBetween(-3, 0)).alias("All_Marlboro_Dollar_Sales_Last_4_Weeks"),
+                               )
+       )
+
+# COMMAND ----------
+
+# DBTITLE 1,Joining Stars and Scan volumes
+Volume = (Stars_Volume_13_4_Wk
+         .join(Stars_Mkt_Share_4_Wk, (Stars_Volume_13_4_Wk.Rc_Num == Stars_Mkt_Share_4_Wk.Rc_Num) & (Stars_Volume_13_4_Wk.WeekEndDate == Stars_Mkt_Share_4_Wk.WeekEndDate) )
+          .join(Scan_Volume_4_Wk, (Stars_Volume_13_4_Wk.Rc_Num == Scan_Volume_4_Wk.Rc_Num) & (Stars_Volume_13_4_Wk.WeekEndDate == Scan_Volume_4_Wk.WeekEndDate) ,'left' )
+          .filter( Stars_Volume_13_4_Wk.WeekEndDate >= Stars_Last104wk )
+          .select(Stars_Volume_13_4_Wk.Rc_Num, 
+                  Stars_Volume_13_4_Wk.WeekEndDate,
+                  Stars_Volume_13_4_Wk.Total_Marlboro_Cartons,
+                  Stars_Volume_13_4_Wk.Total_Industry_Cartons,
+                  Stars_Volume_13_4_Wk.Total_Marlboro_Cartons_13_Weeks,
+                  Stars_Volume_13_4_Wk.Total_Industry_Cartons_13_Weeks,
+                  Scan_Volume_4_Wk.Total_Marlboro_Trips,
+                  Scan_Volume_4_Wk.Total_Marlboro_Trips_Last_4_Weeks,
+                  Scan_Volume_4_Wk.Total_Marlboro_Packs,
+                  Scan_Volume_4_Wk.Total_Marlboro_Packs_Last_4_Weeks,
+                  Stars_Volume_13_4_Wk.Total_Marlboro_Cartons_4_Weeks,
+                  Stars_Volume_13_4_Wk.Total_Industry_Cartons_4_Weeks,
+                  Stars_Mkt_Share_4_Wk.Total_Local_Market_Marlboro_Cartons,
+                  Stars_Mkt_Share_4_Wk.Total_Local_Market_Marlboro_Cartons_4_Weeks,
+                  Scan_Volume_4_Wk.All_Marlboro_Dollar_Sales,
+                  Scan_Volume_4_Wk.All_Marlboro_Dollar_Sales_Last_4_Weeks
+                 )
+          .withColumn("Is_Marlboro_Scan",when((Scan_Volume_4_Wk.All_Marlboro_Dollar_Sales.isNotNull()) & (Scan_Volume_4_Wk.All_Marlboro_Dollar_Sales != 0),'Y').otherwise('N'))
+         )
+
+# COMMAND ----------
+
+# DBTITLE 1,Writing Measures into Parquet files
+dbutils.fs.rm("/mnt/ADLS_Reporting/RGM/Volume/",True)
+
+Volume.write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", False).parquet("/mnt/ADLS_Reporting/RGM/Volume/")
+
+# COMMAND ----------
+
+# DBTITLE 1,Current_PD and September PD
+Sales_cycle_Prd = spark.sql("SELECT * FROM Catman.Sales_cycle_Prd")
+current_pd = spark.sql("select sales_cycle_cd from catman.Sales_cycle_Prd where '{0}' between Sales_Cycle_Begin_Dt and Sales_Cycle_End_Dt".format(Stars_MAX_Weekend)).collect()[0][0]
+September_pd = "201909"
+November_pd = "201911"
+November_2018_pd = "201811"
+Wk104_pd = spark.sql("select sales_cycle_cd from catman.Sales_cycle_Prd where '{0}' between Sales_Cycle_Begin_Dt and Sales_Cycle_End_Dt".format(Stars_Last104wk)).collect()[0][0]
+print(Stars_MAX_Weekend,"",current_pd,"",September_pd,"",November_pd,"",Wk104_pd)
+
+# COMMAND ----------
+
+# DBTITLE 1,Pricing
+Scan_Pricing_Stg = (SEP_ScanData.join(Sales_cycle_Prd, SEP_ScanData.WeekEndDate.between(Sales_cycle_Prd.Sales_Cycle_Begin_Dt,Sales_cycle_Prd.Sales_Cycle_End_Dt))
+             .select(
+               SEP_ScanData.MatchedAccountNumber.alias("Rc_Num"),
+               Sales_cycle_Prd.Sales_Cycle_Cd.alias("SalesCycleCode"),
+               SEP_ScanData.WeekEndDate,
+               SEP_ScanData.LOCATION_ZIP5,
+              when( (SEP_ScanData.Sub_Brand_Cd =='R0000') & (SEP_ScanData.IsProductPromo == '0') ,SEP_ScanData.SalesAmount).alias("SalesAmount"),
+                when( (SEP_ScanData.Sub_Brand_Cd =='R0000') & (SEP_ScanData.IsProductPromo == '0') ,SEP_ScanData.SalesQtyAdjusted).alias("SalesQtyAdjusted")
+             )
+  .groupBy(col("Rc_Num").alias("Rc_Num"),col("SalesCycleCode"),SEP_ScanData.WeekEndDate,SEP_ScanData.LOCATION_ZIP5)
+ .agg(sum(col("SalesAmount")).alias("SalesAmount"),sum(col("SalesQtyAdjusted")).alias("SalesQtyAdjusted"))
+              ).persist(pyspark.StorageLevel.DISK_ONLY)
+
+# COMMAND ----------
+
+ Scan_Pricing = (Scan_Pricing_Stg.select(Scan_Pricing_Stg.Rc_Num,
+                                       Scan_Pricing_Stg.WeekEndDate,
+                                       when(Scan_Pricing_Stg.SalesCycleCode == September_pd, Scan_Pricing_Stg.SalesAmount/Scan_Pricing_Stg.SalesQtyAdjusted).alias("September_Marlboro_Mainline_Avg_Net_Price"),
+                                       when(Scan_Pricing_Stg.SalesCycleCode == current_pd,Scan_Pricing_Stg.SalesAmount/Scan_Pricing_Stg.SalesQtyAdjusted).alias("Current_Marlboro_Mainline_Avg_Net_Price"),
+                                      )
+                .groupBy(Scan_Pricing_Stg.Rc_Num,Scan_Pricing_Stg.WeekEndDate)
+                .agg(sum(col("September_Marlboro_Mainline_Avg_Net_Price")).alias("September_Marlboro_Mainline_Avg_Net_Price"),sum(col("Current_Marlboro_Mainline_Avg_Net_Price")).alias("Current_Marlboro_Mainline_Avg_Net_Price")
+               ))
+
+# COMMAND ----------
+
+# DBTITLE 1,FSF Pricing
+RetailStorePricingDataCapture = spark.sql("select RetailStorePricingGUID,RetailStoreCallGUID,CurrentPrice,sales_cycle_cd,row_number() over(partition by RetailStorePricingGUID,RetailStoreCallGUID,sales_cycle_cd,CreateDate order by CreateDate desc) as row_num  from salesprofiledata.sep_retailstorepricingdatacapture inner join catman.Sales_cycle_Prd on CreateDate between Sales_Cycle_Begin_Dt and Sales_Cycle_End_Dt where sales_cycle_cd in ('201909','201911','{0}')".format(current_pd)).filter(col("row_num") == 1).drop("row_num")
+
+RetailStorePricing = spark.sql("select RetailStorePricingGUID,RetailStoreGUID,BrandCompanyObjectGUID,CurrentPrice,sales_cycle_cd,row_number() over(partition by RetailStoreGUID,BrandCompanyObjectGUID order by CreateDate desc) as row_num  from salesprofiledata.sep_retailstorepricing inner join catman.Sales_cycle_Prd on CreateDate between Sales_Cycle_Begin_Dt and Sales_Cycle_End_Dt where sales_cycle_cd in ('201909',201911,'{0}') and BrandCompanyObjectGUID in ('0FAF8A23-BBE0-E911-810E-6EAE8B4B5A8B','5A1DE821-3BF7-E011-A5EF-001517C5D911')".format(current_pd)).filter(col("row_num") == 1).drop("row_num")
+
+RetailStore = spark.sql("select distinct RetailStoreGUID,SEP_RetailStore.AccountNumber as Rc_Num from salesprofiledata.SEP_RetailStore inner join Stars_Venue on Stars_Venue.ACCOUNTNUMBER = SEP_RetailStore.AccountNumber ")
+CompanyObject = spark.sql("select distinct CompanyObjectGUID,CompanyObjectcode from salesprofiledata.Sep_COMPANYOBJECT where CompanyObjectcode in ('CO.1.1.1.01.1.436.','CO.1.1.1.01.1.5666.') ")
+RetailStoreCall = spark.sql("select RetailStoreCallGUID,CallTypeGUID from salesprofiledata.sep_retailstorecall")
+CallType = spark.sql("select CallTypeGUID from  salesprofiledata.sep_calltype where CallTypeCode in ('00014','00013','00001','00002','00003')")
+
+# COMMAND ----------
+
+FSF_Price_Capture_Stg = (RetailStorePricing.join(RetailStorePricingDataCapture, RetailStorePricingDataCapture.RetailStorePricingGUID == RetailStorePricing.RetailStorePricingGUID, "left")
+                         .join(RetailStore , RetailStore.RetailStoreGUID == RetailStorePricing.RetailStoreGUID , "inner")
+                         .join(CompanyObject, CompanyObject.CompanyObjectGUID == RetailStorePricing.BrandCompanyObjectGUID,"left")
+                         .join(RetailStoreCall, RetailStoreCall.RetailStoreCallGUID == RetailStorePricingDataCapture.RetailStoreCallGUID,"left")
+                         .join(CallType, CallType.CallTypeGUID == RetailStoreCall.CallTypeGUID, "left")
+                         .select(
+                           RetailStore.Rc_Num,
+                           coalesce(RetailStorePricingDataCapture.sales_cycle_cd,RetailStorePricing.sales_cycle_cd).alias("sales_cycle_cd"),
+                           when((coalesce(RetailStorePricingDataCapture.sales_cycle_cd,RetailStorePricing.sales_cycle_cd) =='201909') & (CompanyObject.CompanyObjectcode == 'CO.1.1.1.01.1.436.'),coalesce(RetailStorePricingDataCapture.CurrentPrice,RetailStorePricing.CurrentPrice)).alias("September_Marlboro_Mainline_Avg_Net_Price"),
+                             when((coalesce(RetailStorePricingDataCapture.sales_cycle_cd,RetailStorePricing.sales_cycle_cd) == current_pd) & (CompanyObject.CompanyObjectcode == 'CO.1.1.1.01.1.5666.'),coalesce(RetailStorePricingDataCapture.CurrentPrice,RetailStorePricing.CurrentPrice)).alias("Current_Marlboro_Mainline_Avg_Net_Price"),
+                           when((coalesce(RetailStorePricingDataCapture.sales_cycle_cd,RetailStorePricing.sales_cycle_cd) == '201911') & (CompanyObject.CompanyObjectcode == 'CO.1.1.1.01.1.5666.'),coalesce(RetailStorePricingDataCapture.CurrentPrice,RetailStorePricing.CurrentPrice)).alias("November_Marlboro_Mainline_Avg_Net_Price")
+                         ).distinct()
+                        )
+
+# COMMAND ----------
+
+FSF_Price_Capture = (FSF_Price_Capture_Stg.join(Sales_cycle_Prd, Sales_cycle_Prd.Sales_Cycle_Cd == FSF_Price_Capture_Stg.sales_cycle_cd,"inner")
+                     .join(date_range_df, date_range_df.WeekEndDate.between(Sales_cycle_Prd.Sales_Cycle_Begin_Dt,Sales_cycle_Prd.Sales_Cycle_End_Dt),"inner")
+                     
+.select(
+  FSF_Price_Capture_Stg.Rc_Num,
+  date_range_df.WeekEndDate,
+  FSF_Price_Capture_Stg.September_Marlboro_Mainline_Avg_Net_Price,
+  FSF_Price_Capture_Stg.Current_Marlboro_Mainline_Avg_Net_Price,
+  FSF_Price_Capture_Stg.November_Marlboro_Mainline_Avg_Net_Price
+       )
+                     .groupBy(FSF_Price_Capture_Stg.Rc_Num,
+  date_range_df.WeekEndDate)
+                     .agg(sum("September_Marlboro_Mainline_Avg_Net_Price").alias("September_FSF_Marlboro_Mainline_Avg_Net_Price"),sum("Current_Marlboro_Mainline_Avg_Net_Price").alias("Current_FSF_Marlboro_Mainline_Avg_Net_Price"),sum("November_Marlboro_Mainline_Avg_Net_Price").alias("November_FSF_Marlboro_Mainline_Avg_Net_Price"))
+)
+
+# COMMAND ----------
+
+# DBTITLE 1,Joining Scan and FSF pricing
+Pricing = (Scan_Pricing.join(FSF_Price_Capture, (FSF_Price_Capture.Rc_Num == Scan_Pricing.Rc_Num) & (FSF_Price_Capture.WeekEndDate == Scan_Pricing.WeekEndDate),"left")
+           .join(Sales_cycle_Prd, Scan_Pricing.WeekEndDate.between(Sales_cycle_Prd.Sales_Cycle_Begin_Dt,Sales_cycle_Prd.Sales_Cycle_End_Dt),"inner")
+           .filter(( Sales_cycle_Prd.Sales_Cycle_Cd ==September_pd ) | ( Sales_cycle_Prd.Sales_Cycle_Cd ==current_pd ))
+.select(Scan_Pricing.Rc_Num,
+        Scan_Pricing.WeekEndDate,
+        Scan_Pricing.September_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)"),
+        FSF_Price_Capture.September_FSF_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)"),
+        when((Scan_Pricing.September_Marlboro_Mainline_Avg_Net_Price.isNotNull()) & (Scan_Pricing.September_Marlboro_Mainline_Avg_Net_Price != 0),Scan_Pricing.September_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)")).otherwise(FSF_Price_Capture.September_FSF_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)")).alias("September_Compare_Marlboro_Mainline_Avg_Net_Price"),
+        Scan_Pricing.Current_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)"),
+        FSF_Price_Capture.Current_FSF_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)"),
+         when((Scan_Pricing.Current_Marlboro_Mainline_Avg_Net_Price.isNotNull()) & (Scan_Pricing.Current_Marlboro_Mainline_Avg_Net_Price != 0),Scan_Pricing.Current_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)")).otherwise(FSF_Price_Capture.Current_FSF_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)")).alias("Current_Compare_Marlboro_Mainline_Avg_Net_Price")
+       )
+)
+
+
+# COMMAND ----------
+
+dbutils.fs.rm("/mnt/ADLS_Reporting/RGM/Pricing/",True)
+
+Pricing.write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", False).parquet("/mnt/ADLS_Reporting/RGM/Pricing/")
+
+# COMMAND ----------
+
+# DBTITLE 1,Zip pricing
+Scan_Pricing_Zip_Stg = (Scan_Pricing_Stg
+        .groupBy(Scan_Pricing_Stg.LOCATION_ZIP5,
+                Scan_Pricing_Stg.WeekEndDate,
+               Scan_Pricing_Stg.SalesCycleCode)
+        .agg(sum(Scan_Pricing_Stg.SalesAmount).alias("Zip_SalesAmount"), sum(Scan_Pricing_Stg.SalesQtyAdjusted).alias("Zip_SalesQtyAdjusted"))
+       )
+
+# COMMAND ----------
+
+# DBTITLE 1,Competitive Pricing
+Sales_Cycle_Price = (Scan_Pricing_Zip_Stg.join(Scan_Pricing_Stg,
+  (Scan_Pricing_Zip_Stg.LOCATION_ZIP5 == Scan_Pricing_Stg.LOCATION_ZIP5) & 
+  (Scan_Pricing_Stg.SalesCycleCode == Scan_Pricing_Zip_Stg.SalesCycleCode) & 
+  (Scan_Pricing_Stg.WeekEndDate == Scan_Pricing_Zip_Stg.WeekEndDate)
+  ,"inner")
+                     .filter(Scan_Pricing_Stg.SalesCycleCode >= November_2018_pd)
+.select(
+  Scan_Pricing_Stg.Rc_Num,
+        Scan_Pricing_Stg.SalesCycleCode,
+        (Scan_Pricing_Stg.SalesAmount/Scan_Pricing_Stg.SalesQtyAdjusted).alias("Marlboro_Mainline_Avg_Net_Price"),
+        ( (Scan_Pricing_Zip_Stg.Zip_SalesAmount) - (Scan_Pricing_Stg.SalesAmount)).alias("SalesAmount"),
+  ( (Scan_Pricing_Zip_Stg.Zip_SalesQtyAdjusted) - (Scan_Pricing_Stg.SalesQtyAdjusted)).alias("SalesQtyAdjusted"),
+       )
+                     .withColumn("Competetive_Market_Marlboro_Mainline_Avg_Net_Price",col("SalesAmount")/col("SalesQtyAdjusted"))
+                     .drop("SalesAmount","SalesQtyAdjusted")
+                     )
+
+
+# COMMAND ----------
+
+dbutils.fs.rm("/mnt/ADLS_Reporting/RGM/Sales_Cycle_Price/",True)
+
+Sales_Cycle_Price.write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", False).parquet("/mnt/ADLS_Reporting/RGM/Sales_Cycle_Price/")
+
+# COMMAND ----------
+
+# DBTITLE 1,Single pack pricing to calculate store list test groups
+Scan_Pricing_Stg_Singlepack = (SEP_ScanData.join(Sales_cycle_Prd, SEP_ScanData.WeekEndDate.between(Sales_cycle_Prd.Sales_Cycle_Begin_Dt,Sales_cycle_Prd.Sales_Cycle_End_Dt))
+                    .filter(Sales_cycle_Prd.Sales_Cycle_Cd.isin(September_pd,November_pd))
+             .select(
+               SEP_ScanData.MatchedAccountNumber.alias("Rc_Num"),
+               Sales_cycle_Prd.Sales_Cycle_Cd.alias("SalesCycleCode"),
+              when( (SEP_ScanData.Sub_Brand_Cd =='R0000') & (SEP_ScanData.IsProductPromo == '0') & (SEP_ScanData.IsMultiPack == "0") ,SEP_ScanData.SalesAmount).alias("SalesAmount"),
+                when( (SEP_ScanData.Sub_Brand_Cd =='R0000') & (SEP_ScanData.IsProductPromo == '0') & (SEP_ScanData.IsMultiPack == "0") ,SEP_ScanData.SalesQtyAdjusted).alias("SalesQtyAdjusted")
+             )
+  .groupBy(col("Rc_Num"),col("SalesCycleCode"))
+ .agg(sum(col("SalesAmount")).alias("SalesAmount"),sum(col("SalesQtyAdjusted")).alias("SalesQtyAdjusted"))
+              )
+
+# COMMAND ----------
+
+StoreList_Scan_Pricing = (Scan_Pricing_Stg_Singlepack
+                          .groupBy(Scan_Pricing_Stg_Singlepack.Rc_Num,
+                                                  Scan_Pricing_Stg_Singlepack.SalesCycleCode
+                                                 )
+.agg(when(Scan_Pricing_Stg_Singlepack.SalesCycleCode == September_pd,sum(col("SalesAmount"))/sum(col("SalesQtyAdjusted"))).alias("September_Marlboro_Mainline_Avg_Net_Price"),
+     when(Scan_Pricing_Stg_Singlepack.SalesCycleCode == November_pd,sum(col("SalesAmount"))/sum(col("SalesQtyAdjusted"))).alias("November_Marlboro_Mainline_Avg_Net_Price")
+    )
+                         )
+
+# COMMAND ----------
+
+Store_List_Pricing = (StoreList_Scan_Pricing.join(FSF_Price_Capture_Stg, (FSF_Price_Capture_Stg.Rc_Num == StoreList_Scan_Pricing.Rc_Num) & (FSF_Price_Capture_Stg.sales_cycle_cd == StoreList_Scan_Pricing.SalesCycleCode),"left")
+           .filter(( StoreList_Scan_Pricing.SalesCycleCode ==September_pd ) | ( StoreList_Scan_Pricing.SalesCycleCode ==November_pd ) |( FSF_Price_Capture_Stg.sales_cycle_cd ==September_pd ) | ( FSF_Price_Capture_Stg.sales_cycle_cd ==November_pd ))
+.select(StoreList_Scan_Pricing.Rc_Num,
+        when( ( coalesce( StoreList_Scan_Pricing.SalesCycleCode,FSF_Price_Capture_Stg.sales_cycle_cd) == September_pd ) & (StoreList_Scan_Pricing.September_Marlboro_Mainline_Avg_Net_Price.isNotNull()) & (StoreList_Scan_Pricing.September_Marlboro_Mainline_Avg_Net_Price != 0),StoreList_Scan_Pricing.September_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)")).otherwise(FSF_Price_Capture_Stg.September_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)")).alias("September_Compare_Marlboro_Mainline_Avg_Net_Price"),
+      when( ( coalesce( StoreList_Scan_Pricing.SalesCycleCode,FSF_Price_Capture_Stg.sales_cycle_cd) == November_pd ) &  (StoreList_Scan_Pricing.November_Marlboro_Mainline_Avg_Net_Price.isNotNull()) & (StoreList_Scan_Pricing.November_Marlboro_Mainline_Avg_Net_Price != 0),StoreList_Scan_Pricing.November_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)")).otherwise(FSF_Price_Capture_Stg.November_Marlboro_Mainline_Avg_Net_Price.cast("decimal(18,2)")).alias("November_Compare_Marlboro_Mainline_Avg_Net_Price")
+       )
+                      .groupBy(StoreList_Scan_Pricing.Rc_Num)
+                      .agg(sum(col("September_Compare_Marlboro_Mainline_Avg_Net_Price")).alias("September_Compare_Marlboro_Mainline_Avg_Net_Price"),sum(col("November_Compare_Marlboro_Mainline_Avg_Net_Price")).alias("November_Compare_Marlboro_Mainline_Avg_Net_Price"))
+)
+
+
+# COMMAND ----------
+
+dbutils.fs.rm("/mnt/ADLS_Reporting/RGM/Store_List_Pricing/",True)
+
+Store_List_Pricing.write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", False).parquet("/mnt/ADLS_Reporting/RGM/Store_List_Pricing/")
+
+# COMMAND ----------
+
+sep_sdf_shipments_data.unpersist()
+SEP_ScanData.unpersist()

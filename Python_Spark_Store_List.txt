@@ -1,0 +1,172 @@
+# Databricks notebook source
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+from pyspark.sql.window import *
+
+# COMMAND ----------
+
+# MAGIC %run
+# MAGIC /DataEngineering/EIM/Functions/Copy_Function
+
+# COMMAND ----------
+
+ProdRefinedPath ="/mnt/ADLS_Refined/SalesDataFoundation/Profile/"
+path = "/mnt/ADLS_Staging/IRI/Venue_Staging/"
+tmp_path = "/mnt/ADLS_Staging/IRI/Venue_Staging/Venue_Initiative"
+tmppath = "/mnt/ADLS_Staging/IRI/Venue_Staging/Venue_Initiative1"
+
+# COMMAND ----------
+
+ProfileDBName = 'salesprofiledata'
+SatrsDBName ='starsdata'
+
+# COMMAND ----------
+
+spark.read.parquet("/mnt/ADLS_Staging/IRI/Venue_Staging/Initiative/SEP_Initiative_Program_Current/").createOrReplaceTempView("SEP_Initiative_Program_Current")
+spark.read.parquet("/mnt/ADLS_Staging/IRI/Venue_Staging/Initiative/SEP_Initiative_Program/").createOrReplaceTempView("SEP_Initiative_Program")
+
+# COMMAND ----------
+
+# DBTITLE 1,Filtering Initiatives
+SEP_Initiative_Program = spark.sql("select * from SEP_Initiative_Program where CompanyName in ('Marlboro','Cigarette') and Brand_Grouping in ('PM USA','Marlboro') ")
+Sales_cycle_Prd = spark.sql("SELECT * FROM Catman.Sales_cycle_Prd")
+SEP_Initiative_Program_Current = spark.sql("select * from SEP_Initiative_Program_Current where CompanyName in ('Marlboro','Cigarette') and Brand_Grouping in ('PM USA','Marlboro')")
+
+# COMMAND ----------
+
+# DBTITLE 1,Calculating Static Initiative
+Initiative_Static = (SEP_Initiative_Program.join(Sales_cycle_Prd,  Sales_cycle_Prd.Sales_Cycle_End_Dt.between(SEP_Initiative_Program.EffectiveDate,SEP_Initiative_Program.TerminationDate))
+ .filter( (((Sales_cycle_Prd.Sales_Cycle_Cd.isin('201910')) & SEP_Initiative_Program.InitiativeTypeDescription.isin('BEF Option','Performance Option')) | ((Sales_cycle_Prd.Sales_Cycle_Cd.isin('201911')) & SEP_Initiative_Program.InitiativeTypeDescription.isin('Strategic Option')))  & (SEP_Initiative_Program.EffectiveDate < Sales_cycle_Prd.Sales_Cycle_End_Dt) & ( SEP_Initiative_Program.TerminationDate >= Sales_cycle_Prd.Sales_Cycle_End_Dt) )
+ .select( SEP_Initiative_Program.AccountNumber,
+         SEP_Initiative_Program.EffectiveDate,
+         SEP_Initiative_Program.TerminationDate,
+         SEP_Initiative_Program.Election,
+         SEP_Initiative_Program.InitiativeTypeDescription,
+         Sales_cycle_Prd.Sales_Cycle_Cd,
+         when(((Sales_cycle_Prd.Sales_Cycle_Cd == '201910') & (SEP_Initiative_Program.InitiativeTypeDescription =='Performance Option')),'Oct_2019_MPO').when(((Sales_cycle_Prd.Sales_Cycle_Cd == '201910') & (SEP_Initiative_Program.InitiativeTypeDescription =='BEF Option')),'Oct_2019_BEF').when(((Sales_cycle_Prd.Sales_Cycle_Cd == '201911') & (SEP_Initiative_Program.InitiativeTypeDescription =='Strategic Option')),'Nov_2019_PSO').alias("Text"),
+         SEP_Initiative_Program.Election,
+         #when((Sales_cycle_Prd.Sales_Cycle_Cd == '201910') & (SEP_Initiative_Program.InitiativeTypeDescription =='Performance Option'),SEP_Initiative_Program.Election).otherwise("").alias('Oct_2019_MPO'),
+         #when((Sales_cycle_Prd.Sales_Cycle_Cd == '201910') & (SEP_Initiative_Program.InitiativeTypeDescription =='BEF Option'),SEP_Initiative_Program.Election).otherwise("").alias('Oct_2019_BEF'),
+         #when((Sales_cycle_Prd.Sales_Cycle_Cd == '201911') & (SEP_Initiative_Program.InitiativeTypeDescription =='Strategic Option'),SEP_Initiative_Program.Election).otherwise("").alias('Nov_2019_PSO'),
+         lit("").alias("Current_PSO"),
+  row_number().over(Window.partitionBy(SEP_Initiative_Program.AccountNumber,Sales_cycle_Prd.Sales_Cycle_Cd,SEP_Initiative_Program.InitiativeTypeDescription).orderBy(SEP_Initiative_Program.EffectiveDate.desc())).alias("row_num")
+ )
+ .filter(col("row_num") == 1)
+                     .drop("row_num")
+)
+
+Initiative_Static_Pivot = Initiative_Static.groupBy(Initiative_Static.AccountNumber).pivot("Text").agg(max("Election"))
+
+# COMMAND ----------
+
+# DBTITLE 1,Calculating Current Initiative
+Initiative_Current = (SEP_Initiative_Program_Current.join(Sales_cycle_Prd, ((SEP_Initiative_Program_Current.EffectiveDate < Sales_cycle_Prd.Sales_Cycle_End_Dt) & ( SEP_Initiative_Program_Current.TerminationDate >= Sales_cycle_Prd.Sales_Cycle_End_Dt)) & ((Sales_cycle_Prd.Sales_Cycle_Begin_Dt < current_date()) & (Sales_cycle_Prd.Sales_Cycle_End_Dt >= current_date()))  )
+ .filter( SEP_Initiative_Program_Current.InitiativeTypeDescription.isin('Strategic Option') )
+ .select( SEP_Initiative_Program_Current.AccountNumber,
+        SEP_Initiative_Program_Current.Election.alias('Current_PSO'),
+         Sales_cycle_Prd.Sales_Cycle_Cd,
+         row_number().over(Window.partitionBy(SEP_Initiative_Program_Current.AccountNumber,Sales_cycle_Prd.Sales_Cycle_Cd,SEP_Initiative_Program_Current.InitiativeTypeDescription).orderBy(SEP_Initiative_Program_Current.EffectiveDate.desc())).alias("row_num")
+ )
+ .filter(col("row_num") == 1)
+                      .drop("row_num")
+)
+
+# COMMAND ----------
+
+# DBTITLE 1,Calculate current sales cycle cd
+Stars_MAX_Weekend = spark.sql("SELECT CAST(MAX(Week_End_Date) AS DATE) AS Weekenddate FROM catman.WeekEnding_Report").collect()[0][0]
+print(Stars_MAX_Weekend)
+Current_Sales_Cycle_Cd = Sales_cycle_Prd.filter(((Sales_cycle_Prd.Sales_Cycle_Begin_Dt < Stars_MAX_Weekend) & (Sales_cycle_Prd.Sales_Cycle_End_Dt >= Stars_MAX_Weekend))  ).select(Sales_cycle_Prd.Sales_Cycle_Cd).collect()[0][0]
+September_pd = "201909"
+November_pd = "201911"
+print(Current_Sales_Cycle_Cd,"",September_pd,"",November_pd)
+
+# COMMAND ----------
+
+# DBTITLE 1,Changed PSO
+Changed_PSO_DF_STG = (SEP_Initiative_Program.join(Sales_cycle_Prd,  Sales_cycle_Prd.Sales_Cycle_End_Dt.between(SEP_Initiative_Program.EffectiveDate,SEP_Initiative_Program.TerminationDate))
+                .filter(  SEP_Initiative_Program.InitiativeTypeDescription.isin('Strategic Option') & (Sales_cycle_Prd.Sales_Cycle_Cd.between('201911',Current_Sales_Cycle_Cd) ))
+                .select(SEP_Initiative_Program.AccountNumber,
+                        SEP_Initiative_Program.Election,
+                        Sales_cycle_Prd.Sales_Cycle_Cd,
+                        rank().over(Window.partitionBy(SEP_Initiative_Program.AccountNumber,SEP_Initiative_Program.Election).orderBy(SEP_Initiative_Program.Election)).alias("row_num")
+                
+               )
+                .distinct()
+             ) 
+
+Changed_PSO_DF_Max = Changed_PSO_DF_STG.groupBy(Changed_PSO_DF_STG.AccountNumber).agg(max(col("row_num")).alias("row_num"))
+
+Changed_PSO_DF  = Changed_PSO_DF_Max.withColumn("Changed_PSO",when(col("row_num") >1,'Y').otherwise('N')).drop("row_num")
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Store list dimensions from stars venue
+Store_List_Stg = spark.sql("Select ACCOUNTNUMBER as AccountNumber, \
+                       Location_Nm, \
+                       Ret_AddressLine1, \
+                       Ret_City, \
+                       Location_State_Short_Name, \
+                       Location_ZIP5, \
+                       TERR, \
+                       UNIT as MRKT, \
+                       SECT, \
+                       REGN, \
+                       IS_CHAIN_INDEPENDENT, \
+                       LVL_1_MGMT_CHAINHIER AS LVL_1_MGMT_ACCOUNT ,\
+                       LVL_1_MGMT_CHAINHIER_NAME AS LVL_1_MGMT_ACCOUNT_NAME ,\
+                       LVL_2_MGMT_CHAINHIER AS LVL_2_MGMT_ACCOUNT ,\
+                       LVL_2_MGMT_CHAINHIER_NAME AS LVL_2_MGMT_ACCOUNT_NAME ,\
+                       LVL_3_MGMT_CHAINHIER AS LVL_3_MGMT_ACCOUNT, \
+                       LVL_3_MGMT_CHAINHIER_NAME AS LVL_3_MGMT_ACCOUNT_NAME ,\
+                       LVL_4_MGMT_CHAINHIER AS LVL_4_MGMT_ACCOUNT ,\
+                       LVL_4_MGMT_CHAINHIER_NAME AS LVL_4_MGMT_ACCOUNT_NAME ,\
+                       LVL_5_MGMT_CHAINHIER AS LVL_5_MGMT_ACCOUNT ,\
+                       LVL_5_MGMT_CHAINHIER_NAME AS LVL_5_MGMT_ACCOUNT_NAME ,\
+                       LVL_6_MGMT_CHAINHIER AS LVL_6_MGMT_ACCOUNT ,\
+                       LVL_6_MGMT_CHAINHIER_NAME AS LVL_6_MGMT_ACCOUNT_NAME \
+                       from starsdata.stars_Venue \
+                       where Location_Type_Cd = 'RETAILSTORE' AND \
+                             IS_OPEN_FOR_BUSINESS = 'Y' AND \
+                             IS_OPEN_IN_SYSTEM = 'Y' AND \
+                             IS_CALLEDON_STORE = 'Y' AND \
+                             Location_State_Short_Name IN ('MI','TN')")
+
+# COMMAND ----------
+
+# DBTITLE 1,Recommended_PSO & Pricing for store list
+Recommended_PSO = spark.read.csv("/mnt/ADLS_Refined/BusinessDataSet/RGM/Recommended_PSO.dat",sep=",",header = True).withColumnRenamed("Recommended SPO","Recommended_SPO")
+Store_List_Pricing = spark.read.parquet("/mnt/ADLS_Reporting/RGM/Store_List_Pricing/")
+Store_List_Pricing.createOrReplaceTempView("Store_List_Pricing")
+
+# COMMAND ----------
+
+# DBTITLE 1,Joining Initiatives with stars venue
+Store_List = (Store_List_Stg.join(Initiative_Static_Pivot, Initiative_Static_Pivot.AccountNumber == Store_List_Stg.AccountNumber,'left').drop(Initiative_Static_Pivot.AccountNumber)
+              .join(Initiative_Current, Initiative_Current.AccountNumber == Store_List_Stg.AccountNumber,"left").drop(Initiative_Current.AccountNumber)
+               .join(Changed_PSO_DF, Changed_PSO_DF.AccountNumber == Store_List_Stg.AccountNumber,"left").drop(Changed_PSO_DF.AccountNumber)
+              .join(Recommended_PSO, Recommended_PSO.RCN == Store_List_Stg.AccountNumber,"left").drop(Recommended_PSO.RCN)
+              .join(Store_List_Pricing, Store_List_Pricing.Rc_Num == Store_List_Stg.AccountNumber,"left").drop(Store_List_Pricing.Rc_Num)
+ .select("*")
+             .withColumn("Test_Group", 
+                         when( (Store_List_Stg.Location_State_Short_Name == 'TN')  & (  ((Store_List_Pricing.November_Compare_Marlboro_Mainline_Avg_Net_Price)) <  (Store_List_Pricing.September_Compare_Marlboro_Mainline_Avg_Net_Price + 0.02)), "Test1" )
+                          .when( (Store_List_Stg.Location_State_Short_Name == 'MI')  & ((Store_List_Pricing.November_Compare_Marlboro_Mainline_Avg_Net_Price) < (Store_List_Pricing.September_Compare_Marlboro_Mainline_Avg_Net_Price)), "Test1" )
+                           .when( (Store_List_Stg.Location_State_Short_Name == 'TN')  & ((Store_List_Pricing.September_Compare_Marlboro_Mainline_Avg_Net_Price + 0.18 ) < (Store_List_Pricing.November_Compare_Marlboro_Mainline_Avg_Net_Price )), "Test2" )
+                         .when( (Store_List_Stg.Location_State_Short_Name == 'MI')  & ((Store_List_Pricing.September_Compare_Marlboro_Mainline_Avg_Net_Price + 0.2) < (Store_List_Pricing.November_Compare_Marlboro_Mainline_Avg_Net_Price)), "Test2" )
+                         .when( (Store_List_Stg.Location_State_Short_Name == 'TN')  & (abs(Store_List_Pricing.November_Compare_Marlboro_Mainline_Avg_Net_Price).between(Store_List_Pricing.September_Compare_Marlboro_Mainline_Avg_Net_Price + 0.02, Store_List_Pricing.September_Compare_Marlboro_Mainline_Avg_Net_Price + 0.18)), "Control" )
+                          .when( (Store_List_Stg.Location_State_Short_Name == 'MI')  & (abs(Store_List_Pricing.November_Compare_Marlboro_Mainline_Avg_Net_Price).between(Store_List_Pricing.September_Compare_Marlboro_Mainline_Avg_Net_Price,Store_List_Pricing.September_Compare_Marlboro_Mainline_Avg_Net_Price + 0.2)), "Control" ) 
+                        )
+               .withColumn("Recommended_PSO",Recommended_PSO.Recommended_SPO)
+              .drop("Recommended_SPO",
+                "September_Marlboro_Mainline_Net_Price","November_Marlboro_Mainline_Net_Price"
+                    ,"September_Compare_Marlboro_Mainline_Avg_Net_Price","November_Compare_Marlboro_Mainline_Avg_Net_Price"
+                    ,"Sales_Cycle_Cd"
+                   )
+             )
+
+# COMMAND ----------
+
+# DBTITLE 1,Writing into Parquet file
+dbutils.fs.rm ("/mnt/ADLS_Reporting/RGM/Retail_Venue/",True) 
+Store_List.write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", False).parquet("/mnt/ADLS_Reporting/RGM/Retail_Venue/")

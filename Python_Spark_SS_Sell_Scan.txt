@@ -1,0 +1,178 @@
+# Databricks notebook source
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.window import *
+import pyspark
+import numpy as np
+from datetime import *
+import datetime
+spark.conf.set("spark.sql.shuffle.partitions",sc.defaultParallelism*3)
+
+# COMMAND ----------
+
+# MAGIC %run
+# MAGIC /DataEngineering/EIM/Functions/Copy_Function
+
+# COMMAND ----------
+
+# DBTITLE 1,Reading shipment & Date logic
+Retail_Account_Profile = spark.read.parquet("/mnt/ADLS_Reporting/Sell_Sheets/Retail_Account_Profile/")
+Retail_Account_Profile.createOrReplaceTempView("Retail_Account_Profile")
+
+Stars_Venue = spark.sql("select LOCATION_ACCOUNTNUMBER, LOCATION_ZIP5,IS_CHAIN_INDEPENDENT,CHAINACCOUNT,AGDC_2020_ScanData_Program from ild.stars_venue  inner join Retail_Account_Profile on LOCATION_ACCOUNTNUMBER = Retail_Account_Profile.AccountNumber ")
+
+Msa_Brandmaster = spark.sql("select MSA_Brand_Cd,Brand_Family_Desc,Brand_Family_Cd,MSA_Category_Desc,MSA_Category_Cd,Sub_Brand_Cd,Price_Tier_Desc,Brand_Family_Desc from starsdata.msa_brandmaster")
+
+Max_WeekEndDate = spark.sql("SELECT cast(Max(Week_End_Date) as date) as Max_WeekEndDate FROM catman.WEEKENDING_REPORT")  .collect()[0][0]
+Last26wk = Max_WeekEndDate - timedelta(days=(25*7))
+Last52wk = Max_WeekEndDate - timedelta(days=(51*7))
+Last26wk_yago = Max_WeekEndDate - timedelta(days=(77*7))
+Lastyear = datetime.datetime(int(datetime.datetime.now().strftime("%Y"))-1,1,1)
+Lastyear_End = datetime.datetime(int(datetime.datetime.now().strftime("%Y"))-1,12,31)
+Two_Years = datetime.datetime(int(datetime.datetime.now().strftime("%Y"))-2,1,1)
+print(Max_WeekEndDate,Last26wk,Last52wk,Last26wk_yago, Lastyear, Lastyear_End,Two_Years)
+##yago 26 wk
+SEP_SDF_Shipments_Data = spark.sql("select msareportedshiptoaccountnumber as Account_Number,WeekEndDate,Brand_Family_Cd,MSA_Category_Cd, msa_category_Desc, manufacturer_cd,MSAPromoCode,Price_Tier_Desc,Brand_Family_Desc,cast(sum(ShipQty) AS Decimal(18,2)) as Ship_Qty from starsdata.SEP_SDF_SHIPMENTS_DATA A inner join starsdata.MSA_BRANDMASTER B on A.Material_Id = B.MSA_Brand_Cd where cast(WeekEndDate as date) >= '{}' and PRShipment = 0 and ShipmentTypeCode not in ('Z001','Z004','Z011','Z031') group by 1,2,3,4,5,6,7,8,9 ".format(Two_Years))
+
+
+# COMMAND ----------
+
+# DBTITLE 1,26Wk_Vol_Logic
+Wk26_Vol = (SEP_SDF_Shipments_Data
+                .select(SEP_SDF_Shipments_Data.Account_Number,
+                        when( (SEP_SDF_Shipments_Data.Brand_Family_Cd == '327') & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("26_Wk_Vol"),
+                         when( (SEP_SDF_Shipments_Data.MSA_Category_Cd == '3123') & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("26_Wk_Vol_All"),
+                        when( (SEP_SDF_Shipments_Data.Brand_Family_Cd == '327') & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk_yago) & (SEP_SDF_Shipments_Data.WeekEndDate < Last52wk),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("Prior_26_Wk_Vol"),
+                        when((SEP_SDF_Shipments_Data.MSA_Category_Cd == 3123) & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk) & (SEP_SDF_Shipments_Data.Price_Tier_Desc.isin('Premium','Super Premium')) & (SEP_SDF_Shipments_Data.Brand_Family_Desc != 'Chesterfield Prem'),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("Premium_26_Wk_Vol"),
+                        when((SEP_SDF_Shipments_Data.Brand_Family_Cd == '327') & (SEP_SDF_Shipments_Data.MSAPromoCode.isin("3","134") == False) & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("Promo_26_Wk_Vol"),
+                        when((SEP_SDF_Shipments_Data.MSA_Category_Cd == 3123) & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk) & ((SEP_SDF_Shipments_Data.Price_Tier_Desc.isin('Premium','Super Premium') ==False) | (SEP_SDF_Shipments_Data.Brand_Family_Desc == 'Chesterfield Prem')),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("Discount_26_Wk_Vol")
+                        
+                )
+                                 .groupBy(SEP_SDF_Shipments_Data.Account_Number)
+                                 .agg((sum(col("26_Wk_Vol"))/26).cast("decimal(18,2)").alias("Avg_26_Wk_Vol"),
+                                      (sum(col("Prior_26_Wk_Vol"))/26).cast("decimal(18,2)").alias("Avg_Prior_26_Wk_Vol"),
+                                       sum(col("26_Wk_Vol")).cast("decimal(18,2)").alias("Tot_26_Wk_Vol"),
+                                       sum(col("Premium_26_Wk_Vol")).cast("decimal(18,2)").alias("Premium_26_Wk_Vol"),
+                                      sum(col("Promo_26_Wk_Vol")).cast("decimal(18,2)").alias("Promo_26_Wk_Vol"),
+                                      sum(col("Discount_26_Wk_Vol")).cast("decimal(18,2)").alias("Discount_Volume_26Wk"),
+                                      sum(col("26_Wk_Vol_All")).cast("decimal(18,2)").alias("26_Wk_Vol_All")
+                                      
+                                     )
+                .withColumn("Volume_Change_26Wk_Yago", (((col("Avg_26_Wk_Vol")-col("Avg_Prior_26_Wk_Vol"))/col("Avg_Prior_26_Wk_Vol"))*100).cast("decimal(18,2)"))
+                .withColumn("Percent_Product_Promotion_26Wk",(col("Promo_26_Wk_Vol")/col("Tot_26_Wk_Vol")*100).cast("decimal(18,2)"))
+                .withColumn("Discount_Share_26Wk", (100- ((col("Premium_26_Wk_Vol")/col("26_Wk_Vol_All"))*100)).cast("decimal(18,2)"))
+                                 
+          )
+
+# COMMAND ----------
+
+# DBTITLE 1,Independent store calculation
+Stars_Venue_Ind =spark.sql( "select distinct  LOCATION_ZIP5,LOCATION_ACCOUNTNUMBER FROM ild.stars_venue inner join Retail_Account_Profile on LOCATION_ACCOUNTNUMBER = Retail_Account_Profile.AccountNumber WHERE LOCATION_ZIP5 IN (select  LOCATION_ZIP5\
+ from  ild.stars_venue where IS_CHAIN_INDEPENDENT == 'INDEPENDENT'\
+ group by LOCATION_ZIP5  having count( distinct case when CHAINACCOUNT is NULL then LOCATION_ACCOUNTNUMBER else CHAINACCOUNT end ) >= 6)")
+
+
+Mrkt_Share_Ind = (SEP_SDF_Shipments_Data.join(Stars_Venue_Ind,SEP_SDF_Shipments_Data.Account_Number == Stars_Venue_Ind.LOCATION_ACCOUNTNUMBER)
+                     .filter((((SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk_yago) & (SEP_SDF_Shipments_Data.WeekEndDate < Last52wk)) |(SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk)) & (SEP_SDF_Shipments_Data.Brand_Family_Cd == '327') )
+                                 .groupBy(Stars_Venue_Ind.LOCATION_ZIP5.alias("PostalCd"))
+                                 .agg(sum(SEP_SDF_Shipments_Data.Ship_Qty/200).alias("Mrkt_Vol"))
+                                 
+          )
+Account_Share_Ind = (SEP_SDF_Shipments_Data.join(Stars_Venue_Ind,Stars_Venue_Ind.LOCATION_ACCOUNTNUMBER == SEP_SDF_Shipments_Data.Account_Number)
+                     .filter((((SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk_yago) & (SEP_SDF_Shipments_Data.WeekEndDate < Last52wk)) |(SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk)) & (SEP_SDF_Shipments_Data.Brand_Family_Cd == '327'))
+                                 .groupBy(Stars_Venue_Ind.LOCATION_ACCOUNTNUMBER,
+                                          Stars_Venue_Ind.LOCATION_ZIP5.alias("PostalCd"))
+                                 .agg(sum(SEP_SDF_Shipments_Data.Ship_Qty/200).alias("Acct_Vol"))
+                                 
+          )
+
+Ind_Store = (Mrkt_Share_Ind
+ .join(Account_Share_Ind, Account_Share_Ind.PostalCd == Mrkt_Share_Ind.PostalCd,"inner")
+ .filter((Account_Share_Ind.Acct_Vol) < (0.25 * Mrkt_Share_Ind.Mrkt_Vol))
+ .select(
+   Mrkt_Share_Ind.PostalCd,
+   Account_Share_Ind.LOCATION_ACCOUNTNUMBER
+ ).distinct()
+)
+
+# COMMAND ----------
+
+# DBTITLE 1,Ind Volume
+Wk26_Vol_Ind_Zip = (SEP_SDF_Shipments_Data
+                .join(Ind_Store, (Ind_Store.LOCATION_ACCOUNTNUMBER == SEP_SDF_Shipments_Data.Account_Number) )
+                .select(Ind_Store.PostalCd,
+                        when( (SEP_SDF_Shipments_Data.Brand_Family_Cd == '327') & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("26_Wk_Vol"),
+                        when( (SEP_SDF_Shipments_Data.Brand_Family_Cd == '327') & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk_yago) & (SEP_SDF_Shipments_Data.WeekEndDate < Last52wk),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("Prior_26_Wk_Vol")
+                        
+                )
+                                 .groupBy(Ind_Store.PostalCd)
+                                 .agg((sum(col("26_Wk_Vol"))/26).cast("decimal(18,2)").alias("Avg_26_Wk_Vol_Zip_Ind"),
+                                      (sum(col("Prior_26_Wk_Vol"))/26).cast("decimal(18,2)").alias("Avg_Prior_26_Wk_Vol_Zip_Ind"),
+                                      
+                                     )
+          )
+
+Wk26_Vol_Ind_Account = (SEP_SDF_Shipments_Data
+                .join(Ind_Store, (Ind_Store.LOCATION_ACCOUNTNUMBER == SEP_SDF_Shipments_Data.Account_Number) )
+                .select(Ind_Store.LOCATION_ACCOUNTNUMBER,
+                        when( (SEP_SDF_Shipments_Data.Brand_Family_Cd == '327') & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("26_Wk_Vol"),
+                        when( (SEP_SDF_Shipments_Data.Brand_Family_Cd == '327') & (SEP_SDF_Shipments_Data.WeekEndDate >= Last26wk_yago) & (SEP_SDF_Shipments_Data.WeekEndDate < Last52wk),SEP_SDF_Shipments_Data.Ship_Qty/200).alias("Prior_26_Wk_Vol")
+                        
+                )
+                                 .groupBy(Ind_Store.LOCATION_ACCOUNTNUMBER)
+                                 .agg((sum(col("26_Wk_Vol"))/26).cast("decimal(18,2)").alias("Avg_26_Wk_Vol_Acct_Ind"),
+                                      (sum(col("Prior_26_Wk_Vol"))/26).cast("decimal(18,2)").alias("Avg_Prior_26_Wk_Vol_Acct_Ind"),
+                                      
+                                     )
+          )
+
+Wk26_Vol_Ind = (Wk26_Vol_Ind_Zip.join(Ind_Store, Ind_Store.PostalCd == Wk26_Vol_Ind_Zip.PostalCd)
+                .join(Wk26_Vol_Ind_Account, Wk26_Vol_Ind_Account.LOCATION_ACCOUNTNUMBER == Ind_Store.LOCATION_ACCOUNTNUMBER)
+                .select(
+                  Ind_Store.LOCATION_ACCOUNTNUMBER,
+                  ((Wk26_Vol_Ind_Account.Avg_26_Wk_Vol_Acct_Ind/Wk26_Vol_Ind_Zip.Avg_26_Wk_Vol_Zip_Ind)*100).cast("decimal(18,2)").alias("Avg_26_Wk_Vol_Ind"),
+                  ((Wk26_Vol_Ind_Account.Avg_Prior_26_Wk_Vol_Acct_Ind / Wk26_Vol_Ind_Zip.Avg_Prior_26_Wk_Vol_Zip_Ind )*100).cast("decimal(18,2)").alias("Avg_Prior_26_Wk_Vol_Ind")
+                )
+                .withColumn("Volume_Change_Ind_26Wk_Yago", (((col("Avg_26_Wk_Vol_Ind")-col("Avg_Prior_26_Wk_Vol_Ind"))/col("Avg_Prior_26_Wk_Vol_Ind"))*100).cast("decimal(18,2)"))
+               )
+
+# COMMAND ----------
+
+# DBTITLE 1,AGDC_Payment YAGO volume
+SEP_SDF_Shipments_Data_Payments = ( SEP_SDF_Shipments_Data
+                               .join(Stars_Venue, Stars_Venue.LOCATION_ACCOUNTNUMBER == SEP_SDF_Shipments_Data.Account_Number)
+                               .filter((SEP_SDF_Shipments_Data.WeekEndDate >= Lastyear) & (SEP_SDF_Shipments_Data.WeekEndDate < Lastyear_End) & (SEP_SDF_Shipments_Data.manufacturer_cd == "014"))
+                               .select( 
+                                 SEP_SDF_Shipments_Data.Account_Number.alias("Payments_Account_Number"),
+                                 SEP_SDF_Shipments_Data.Ship_Qty
+                               )
+                               .groupBy(col("Payments_Account_Number"))
+                               .agg(sum(col("Ship_Qty")/200).cast("decimal(18,2)").alias("Volume_Yago_Cpw")
+                                   )
+                                  )
+
+# COMMAND ----------
+
+# DBTITLE 1,Final Dataframe join
+SS_Sell_Scan = (Wk26_Vol.join(Stars_Venue, (Stars_Venue.LOCATION_ACCOUNTNUMBER == Wk26_Vol.Account_Number))
+                .join(Wk26_Vol_Ind, (Wk26_Vol_Ind.LOCATION_ACCOUNTNUMBER == Stars_Venue.LOCATION_ACCOUNTNUMBER),"left" )
+                .join(SEP_SDF_Shipments_Data_Payments, SEP_SDF_Shipments_Data_Payments.Payments_Account_Number == Wk26_Vol.Account_Number, "left")
+                .select(
+                  Wk26_Vol.Account_Number,
+                  Wk26_Vol.Avg_26_Wk_Vol.alias("Avg_26_Wk_Vol_Cpw"),
+                  Wk26_Vol.Avg_Prior_26_Wk_Vol.alias("Avg_Prior_26_Wk_Vol_Cpw"),
+                  Wk26_Vol.Volume_Change_26Wk_Yago.alias("Volume_Change_26Wk_Yago"),
+                  Wk26_Vol_Ind.Avg_26_Wk_Vol_Ind.alias("Avg_26_Wk_Vol_Ind_Cpw"),
+                  Wk26_Vol_Ind.Avg_Prior_26_Wk_Vol_Ind.alias("Avg_Prior_26_Wk_Vol_Ind_Cpw"),
+                  Wk26_Vol_Ind.Volume_Change_Ind_26Wk_Yago.alias("Volume_Change_Ind_26Wk_Yago"),
+                  Wk26_Vol.Percent_Product_Promotion_26Wk.alias("Percent_Product_Promotion_26Wk"),
+                  Wk26_Vol.Discount_Volume_26Wk.alias("Discount_Volume_26Wk_Cpw"),
+                  Wk26_Vol.Discount_Share_26Wk.alias("Discount_Share_26Wk"),
+                  SEP_SDF_Shipments_Data_Payments.Volume_Yago_Cpw.alias("Volume_Yago_Cpw")
+                ).distinct()
+               )
+
+# COMMAND ----------
+
+dbutils.fs.rm ("/mnt/ADLS_Reporting/Sell_Sheets/SS_Sell_Scan/",True) 
+SS_Sell_Scan.write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", True).parquet("/mnt/ADLS_Reporting/Sell_Sheets/SS_Sell_Scan/")

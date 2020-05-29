@@ -1,0 +1,1391 @@
+# Databricks notebook source
+Sep_RetailStorePricing = spark.read.parquet("/mnt/ADLS_Refined/SalesDataFoundation/Profile/SEP_RetailStorePricing/")
+Sep_RetailStorePricing.createOrReplaceTempView("Sep_RetailStorePricing")
+
+# COMMAND ----------
+
+# DBTITLE 1,Catman_Rtl_Str_Pricing_Wrk_S
+SALESCYCLE_VT = spark.sql("SELECT \
+                          C.SALESCYCLECODE,\
+                          A.SALESCYCLECALENDARGUID, \
+                          C.SalesCycleStartDate,\
+                          C.SalesCycleEndDate\
+                          FROM\
+                          salesprofiledata.SEP_SALESCYCLECALENDAR A\
+                          JOIN \
+                          (\
+                          SELECT \
+                          SALESCYCLECODE,\
+                          SalesCycleStartDate,\
+                          SalesCycleEndDate\
+                          FROM \
+                          (\
+                          SELECT \
+                          SALESCYCLECODE,\
+                          SalesCycleStartDate,\
+                          SalesCycleEndDate, \
+                          RANK() OVER (ORDER BY SALESCYCLEENDDATE DESC) AS RNK\
+                          FROM \
+                          (\
+                          SELECT \
+                          SALESCYCLECODE, \
+                          MIN(SalesCycleStartDate) as SalesCycleStartDate, \
+                          MAX(SALESCYCLEENDDATE) as SalesCycleEndDate \
+                          FROM salesprofiledata.SEP_SALESCYCLECALENDAR\
+                          GROUP BY 1\
+                          ) A\
+                          WHERE CURRENT_DATE >= SALESCYCLEENDDATE OR CURRENT_DATE BETWEEN SalesCycleStartDate AND SalesCycleEndDate\
+                          ) B\
+                          WHERE RNK <=9  \
+                          ) C\
+                          ON A.SALESCYCLECODE=C.SALESCYCLECODE")
+
+# COMMAND ----------
+
+SALESCYCLE_VT.createOrReplaceTempView('SALESCYCLE_VT')
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view UPDT_TS as 
+# MAGIC SELECT CAST(COALESCE(CASE WHEN UPDT.UPDT_TS IS NULL THEN SCC_DT.UPDT_TS END , UPDT.UPDT_TS) as date) as UPDT_TS FROM 
+# MAGIC (
+# MAGIC SELECT MAX(UPDT_TS)  as UPDT_TS FROM Catman.Catman_Rtl_Str_Pricing_Stg
+# MAGIC ) UPDT
+# MAGIC cross JOIN 
+# MAGIC (
+# MAGIC SELECT MIN(SalesCycleStartDate) as UPDT_TS from SALESCYCLE_VT
+# MAGIC ) SCC_DT 
+
+# COMMAND ----------
+
+RSP_GUID_VT = spark.sql("SELECT DISTINCT RETAILSTOREPRICINGGUID \
+                          FROM SEP_RETAILSTOREPRICING A\
+                          JOIN SALESCYCLE_VT B\
+                          ON A.SALESCYCLECALENDARGUID=B.SALESCYCLECALENDARGUID\
+                          JOIN  UPDT_TS\
+                          ON A.UpdateDate >=UPDT_TS.UPDT_TS\
+                          \
+                          UNION\
+                          \
+                          SELECT DISTINCT A.RETAILSTOREPRICINGGUID \
+                          FROM salesprofiledata.SEP_RETAILSTOREPRICINGDATACAPTURE A\
+                          JOIN SEP_RETAILSTOREPRICING B\
+                          ON A.RETAILSTOREPRICINGGUID=B.RETAILSTOREPRICINGGUID\
+                          JOIN SALESCYCLE_VT C\
+                          ON C.SALESCYCLECALENDARGUID=B.SALESCYCLECALENDARGUID\
+                          JOIN UPDT_TS \
+                          ON A.UpdateDate >=UPDT_TS.UPDT_TS")
+
+# COMMAND ----------
+
+RSP_GUID_VT.createOrReplaceTempView('RSP_GUID_VT')
+
+# COMMAND ----------
+
+RS_EXT_ATT_VT = spark.sql("SELECT DISTINCT\
+                          RSEA.RetailstoreGUID\
+                          ,RSEA.CompanyObjectGUID \
+                          ,CO.HierarchyDescription  Scan_CompanyObjectDescription\
+                          ,CO.Level3Description  Scan_OpCoDesc\
+                          ,SalesCycleCode\
+                          ,RSEA.EffectiveDate\
+                          ,RSEA.TerminationDate\
+                          FROM \
+                          salesprofiledata.sep_RetailStoreExtendedAttributes RSEA \
+                          INNER JOIN salesprofiledata.SEP_Attributetype ATT \
+                          ON RSEA.AttributeTypeGUID = ATT.AttributeTypeGUID\
+                          INNER JOIN catman.CATMAN_SER_DIM_CompanyObject CO \
+                          ON CO.CompanyobjectGUID = RSEA.CompanyObjectGUID\
+                          INNER JOIN SALESCYCLE_VT \
+                          ON SalesCycleEndDate BETWEEN RSEA.EffectiveDate AND RSEA.TerminationDate\
+                          WHERE \
+                          ATT.AttributeTypeDescription = 'Scan Automation'\
+                          AND AttributeValue IN ('C','R')\
+                          ")
+
+# COMMAND ----------
+
+RS_EXT_ATT_VT.createOrReplaceTempView('RS_EXT_ATT_VT')
+
+# COMMAND ----------
+
+RSP_VT = spark.sql("SELECT RS.ACCOUNTNUMBER,C.SalesCycleCode,\
+                            RSP.*\
+                            FROM \
+                            SEP_RETAILSTOREPRICING RSP\
+                            JOIN salesprofiledata.SEP_RETAILSTORE RS\
+                            ON RS.RETAILSTOREGUID=RSP.RETAILSTOREGUID\
+                            JOIN RSP_GUID_VT \
+                            ON RSP_GUID_VT.RETAILSTOREPRICINGGUID=RSP.RETAILSTOREPRICINGGUID\
+                            JOIN salesprofiledata.SEP_SALESCYCLECALENDAR C\
+                            ON RSP.SALESCYCLECALENDARGUID=C.SALESCYCLECALENDARGUID")
+
+# COMMAND ----------
+
+RSP_VT.createOrReplaceTempView('RSP_VT')
+
+# COMMAND ----------
+
+PDC_VT = spark.sql("SELECT PDC.* \
+                            FROM salesprofiledata.SEP_RetailstorePricingDataCapture PDC \
+                            JOIN RSP_GUID_VT \
+                            ON RSP_GUID_VT.RETAILSTOREPRICINGGUID=PDC.RETAILSTOREPRICINGGUID ")
+
+# COMMAND ----------
+
+PDC_VT.createOrReplaceTempView('PDC_VT')
+
+# COMMAND ----------
+
+MAXCALLDATE_VT = spark.sql("SELECT  RSP.RetailStoreGUID ,EA.EffectiveDate , EA.Terminationdate, MAX(COALESCE(RC.UserDefinedCallDate,RC.CallDate) ) CallDate \
+                                    FROM RSP_VT RSP\
+                                    INNER JOIN SALESCYCLE_VT SCC \
+                                    ON SCC.SalesCycleCALENDARGUID = rsp.SalesCycleCalendarGUID\
+                                    INNER JOIN RS_EXT_ATT_VT EA \
+                                    ON RSP.RetailStoreGUID = EA.RetailStoreGUID\
+                                    AND EA.Scan_CompanyObjectDescription = RSP.CategoryName\
+                                    AND EA.Scan_OpCoDesc = RSP.CompanyName	\
+                                    AND EA.SalesCycleCode=SCC.SalesCycleCode	\
+                                    INNER JOIN PDC_VT PDC \
+                                    ON rsp.retailstorepricingguid = pdc.retailstorepricingguid	\
+                                    INNER JOIN salesprofiledata.SEP_RETAILSTORECALL RC \
+                                    ON RC.RetailStoreCallGUID = PDC.RetailStoreCallGUID\
+                                    AND COALESCE(RC.UserDefinedCallDate,RC.CallDate) BETWEEN EA.EffectiveDate AND EA.TerminationDate\
+                                    INNER JOIN salesprofiledata.SEP_CallType CTYP \
+                                    ON CTYP.CallTypeGUID = RC.CallTypeGUID\
+                                    WHERE	CallTypeCode = '00006'	\
+                                    GROUP	BY RSP.RetailStoreGUID,EA.EffectiveDate , EA.Terminationdate")
+
+# COMMAND ----------
+
+MAXCALLDATE_VT.createOrReplaceTempView('MAXCALLDATE_VT')
+
+# COMMAND ----------
+
+CATMAN_RETAILSTOREPRICING_SOURCE_VT1 = spark.sql("SELECT \
+                                                A.RetailStorePricingGUID as RSP_RetailStorePricingGUID  \
+                                                ,A.SalesCycleCalendarGUID as RSP_SalesCycleCalendarGUID\
+                                                ,A.SalesCycleCode as DRV_SalesCycleCode	\
+                                                ,A.RetailStoreGUID as RSP_RetailStoreGUID  \
+                                                ,A.AccountNumber as RSP_Accountnumber\
+                                                ,A.BrandCompanyObjectGUID as RSP_BrandCompanyObjectGUID	\
+                                                ,A.DisplayText as RSP_DisplayText  \
+                                                ,A.CompanyName as RSP_CompanyName \
+                                                ,A.CategoryName as RSP_CategoryName  \
+                                                ,SCANDATA.PDCCURRENTPRICE as PDC_CurrentPrice\
+                                                ,A.CurrentPrice as RSP_CurrentPrice\
+                                                ,A.LEADERSHIPPRICE as RSP_LeadershipPrice\
+                                                ,A.CurrentTotalEligibleAllowances  as RSP_CurrentTotalEligibleAllowances\
+                                                ,CASE WHEN A.CompanyName = 'Competitor' THEN \
+                                                CASE WHEN COALESCE(A.CurrentTotalAcceptedAllowances,0) = 0  and COALESCE(SCANDATA.CurrentAllowances,0)>0 THEN COALESCE(SCANDATA.CurrentAllowances,0) \
+                                                ELSE COALESCE(A.CurrentTotalAcceptedAllowances,0) END  \
+                                                ELSE COALESCE(A.CurrentTotalAcceptedAllowances,0) END as RSP_CurrentTotalAcceptedAllowances \
+                                                ,	SCANDATA.NotInDistribution as PDC_NotInDistribution\
+                                                ,   A.NotInDistribution as RSP_NotInDistribution\
+                                                ,	SCANDATA.CreateDate as PDC_CreateDate \
+                                                ,	A.CreateDate as RSP_CreateDate \
+                                                ,	SCANDATA.UpdateDate as PDC_UpdateDate \
+                                                ,	A.UpdateDate  as RSP_UpdateDate\
+                                                ,	SCANDATA.Createuser as PDC_Createuser\
+                                                ,	A.Createuser as RSP_Createuser\
+                                                ,	SCANDATA.Updateuser as PDC_Updateuser\
+                                                ,	A.Updateuser as RSP_Updateuser\
+                                                ,	SCANDATA.Active	 as PDC_Active  	\
+                                                ,	A.Active as RSP_Active	    \
+                                                , SCANDATA.RetailStorePricingGUID as PDC_RetailStorePricingGUID \
+                                                , SCANDATA.UserDefinedcallDate as RC_UserDefinedcallDate\
+                                                , SCANDATA.CallDate as RC_CallDate\
+                                                , A.Display as RSP_Display\
+                                                , SCANDATA.ApplicationID as ApplicationID\
+                                                , SCANDATA.SalesEmpTypeDescription as SalesEmpTypeDescription\
+                                                , 1 AS IsScanCapture\
+                                                , COALESCE(SCANDATA.ScanCallDate, SCD.CallDate)   as ScanCallDate\
+                                                ,RetailStoreCallGUID as RetailStoreCallGUID\
+                                    FROM RSP_VT A\
+                                    INNER JOIN \
+                                    RS_EXT_ATT_VT EXT\
+                                    ON EXT.RETAILSTOREGUID=A.RETAILSTOREGUID\
+                                    AND EXT.Scan_CompanyObjectDescription=A.CategoryName\
+                                    AND EXT.Scan_OpCoDesc=A.CompanyName \
+                                    AND EXT.SalesCycleCode=A.SalesCycleCode		\
+                                    LEFT OUTER JOIN \
+                                    (\
+                                    SELECT * \
+                                    FROM \
+                                    (\
+                                    SELECT	\
+                                    RP.AccountNumber, \
+                                    RP.SALESCYCLECODE,\
+                                    RP.DisplayText, \
+                                    RP.RetailStoreGUID, \
+                                    RP.BrandCompanyObjectGUID, \
+                                    RP.CompanyName,\
+                                    RP.CategoryName, \
+                                    RP.CurrentPrice, \
+                                    RP.LeadershipPrice, \
+                                    RP.CurrentTotalEligibleAllowances,\
+                                    RP.CurrentTotalAcceptedAllowances, \
+                                    RP.RetailStorePricingGUID,\
+                                    PDC.RetailStorePricingDataCaptureGUID,\
+                                    PDC.CurrentPrice PDCCURRENTPRICE, \
+                                    PDC.NotInDistribution, \
+                                    PDC.CurrentAllowances,\
+                                    RC.UserDefinedCallDate,\
+                                    RC.CallDate,\
+                                    PDC.CREATEDATE,\
+                                    PDC.UPDATEDATE,\
+                                    PDC.CREATEUSER,\
+                                    PDC.UPDATEUSER,\
+                                    PDC.ACTIVE,\
+                                    RC.RETAILSTORECALLGUID,\
+                                    RC.CALLDATE AS SCANCALLDATE,\
+                                    ROW_NUMBER() OVER(PARTITION BY RP.RetailStorePricingGUID , EXT.RetailstoreGUID, RP.BrandCompanyObjectGUID ORDER BY RC.CALLDATE DESC ) AS RNO,\
+                                    CASE WHEN CALLTYPECODE='00006' THEN RC.CALLDATE ELSE RC.USERDEFINEDCALLDATE END  as DEFCALLDATE, \
+                                    CTY.CallTypeCode,\
+                                    CTY.CallTypeDescription,\
+                                    COALESCE(RC.ApplicationID,1) ApplicationID,\
+                                    SalesEmpTypeDescription\
+                                    FROM RSP_VT RP\
+                                    INNER JOIN \
+                                    RS_EXT_ATT_VT EXT\
+                                    ON EXT.RETAILSTOREGUID=RP.RETAILSTOREGUID\
+                                    AND EXT.Scan_CompanyObjectDescription=RP.CategoryName\
+                                    AND EXT.Scan_OpCoDesc=RP.CompanyName \
+                                    AND EXT.SalesCycleCode=RP.SalesCycleCode		\
+                                    LEFT OUTER JOIN \
+                                    PDC_VT PDC	\
+                                        ON	RP.RETAILSTOREPRICINGGUID=PDC.RETAILSTOREPRICINGGUID\
+                                    JOIN \
+                                    salesprofiledata.SEP_RETAILSTORECALL RC\
+                                        ON	PDC.RETAILSTORECALLGUID=RC.RETAILSTORECALLGUID\
+                                    JOIN 	\
+                                    salesprofiledata.SEP_CALLTYPE CTY\
+                                        ON	RC.CALLTYPEGUID=CTY.CALLTYPEGUID\
+                                        INNER JOIN	salesprofiledata.SEP_SalesEmp SSE  ON  RC.SalesEmpGUID = SSE.SalesEmpGUID   \
+                                                                        AND SSE.Active = 1  \
+                                                        INNER JOIN	salesprofiledata.SEP_SalesEmpType EmpType     \
+                                                                        ON	EmpType.SalesEmpTypegUID=SSE.SalesEmpTypeGUID  \
+                                                                            AND EmpType.Active = 1   \
+                                    WHERE \
+                                    CALLTYPECODE='00006'\
+                                    ) SCAN WHERE RNO=1\
+                                    ) SCANDATA\
+                                    ON A.RETAILSTOREPRICINGGUID=SCANDATA.RETAILSTOREPRICINGGUID\
+                                    \
+                                    LEFT OUTER JOIN MAXCALLDATE_VT SCD\
+                                    ON SCD.RETAILSTOREGUID=A.RETAILSTOREGUID")
+
+# COMMAND ----------
+
+CATMAN_RETAILSTOREPRICING_SOURCE_VT2 = spark.sql("SELECT   RSP.RetailStorePricingGUID   as RSP_RetailStorePricingGUID\
+                                                          ,	RSP.SalesCycleCalendarGUID as RSP_SalesCycleCalendarGUID\
+                                                          ,	RSP.SalesCycleCode	as DRV_SalesCycleCode\
+                                                          ,	RSP.RetailStoreGUID  as RSP_RetailStoreGUID\
+                                                          ,   RSP.AccountNumber as RSP_Accountnumber\
+                                                          ,	RSP.BrandCompanyObjectGUID 	as RSP_BrandCompanyObjectGUID\
+                                                          ,	RSP.DisplayText  as RSP_DisplayText\
+                                                          ,	RSP.CompanyName  as RSP_CompanyName\
+                                                          ,	RSP.CategoryName  as RSP_CategoryName\
+                                                          ,	 PDC.CurrentPrice as PDC_CurrentPrice\
+                                                          ,   RSP.CurrentPrice  as RSP_CurrentPrice\
+                                                          ,	 RSP.LeadershipPrice as RSP_LeadershipPrice\
+                                                          ,	RSP.CurrentTotalEligibleAllowances  as RSP_CurrentTotalEligibleAllowances\
+                                                          ,	CASE WHEN RSP.CompanyName = 'Competitor' \
+                                                                          THEN \
+                                                                           CASE WHEN COALESCE(CurrentTotalAcceptedAllowances,0) = 0  and COALESCE(PDC.CurrentAllowances,0)>0 \
+                                                                                       THEN COALESCE(PDC.CurrentAllowances,0) \
+                                                                                        ELSE COALESCE(CurrentTotalAcceptedAllowances,0) \
+                                                                           END  \
+                                                                           ELSE COALESCE(CurrentTotalAcceptedAllowances,0) \
+                                                              END as RSP_CurrentTotalAcceptedAllowances\
+                                                          ,	PDC.NotInDistribution as PDC_NotInDistribution\
+                                                          ,    RSP.NotInDistribution as RSP_NotInDistribution\
+                                                          ,	PDC.CreateDate  as PDC_CreateDate\
+                                                          ,	RSP.CreateDate  as RSP_CreateDate\
+                                                          ,	PDC.UpdateDate as PDC_UpdateDate\
+                                                          ,	RSP.UpdateDate as RSP_UpdateDate\
+                                                          ,	PDC.Createuser as PDC_Createuser\
+                                                          ,	RSP.Createuser as RSP_Createuser\
+                                                          ,	PDC.Updateuser as PDC_Updateuser\
+                                                          ,	RSP.Updateuser as RSP_Updateuser\
+                                                          ,	PDC.Active	 as PDC_Active  	\
+                                                          ,	RSP.Active	    as RSP_Active\
+                                                          ,	PDC.RetailStorePricingGUID  as PDC_RetailStorePricingGUID\
+                                                          ,	PDC.UserDefinedcallDate as RC_UserDefinedcallDate\
+                                                          ,	PDC.CallDate as RC_CallDate\
+                                                               ,	RSP.Display as RSP_Display\
+                                                          ,	PDC.ApplicationID as ApplicationID\
+                                                          ,	PDC.SalesEmpTypeDescription as SalesEmpTypeDescription\
+                                                          ,	0 IsScanCapture\
+                                                          ,	NULL ScanCallDate\
+                                                          ,PDC.RetailStoreCallGUID\
+                                                          FROM RSP_VT RSP\
+                                                              LEFT  JOIN	\
+                                                              (\
+                                                                          SELECT PDC.RetailStorePricingGUID\
+                                                                               , PDC.CurrentPrice\
+                                                                               , PDC.NotInDistribution\
+                                                                               , PDC.CreateDate\
+                                                                               , PDC.UpdateDate\
+                                                                               , PDC.Createuser\
+                                                                               , PDC.Updateuser\
+                                                                               , PDC.CurrentAllowances\
+                                                                               , PDC.Active\
+                                                                               , RC.UserDefinedcallDate\
+                                                                               , RC.CallDate\
+                                                                               , CTYP.CallTypeCode\
+                                                                               , COALESCE(RC.ApplicationID,1) ApplicationID\
+                                                                               ,SalesEmpTypeDescription\
+                                                                               ,PDC.RetailStoreCallGUID\
+                                                                            FROM PDC_VT PDC \
+                                                                            JOIN salesprofiledata.SEP_RetailstoreCall RC  \
+                                                                              ON RC.RetailStoreCallGUID = PDC.RetailStoreCallGUID\
+                                                                             AND RC.Active = 1\
+                                                                             JOIN salesprofiledata.SEP_CallType CTYP \
+                                                                              ON CTYP.CallTypeGUID = RC.CallTypeGUID\
+                                                                              INNER JOIN	salesprofiledata.SEP_SalesEmp SSE  ON  1=1\
+                                                                              AND  (CTYP.CallTypeCode IN ('00001','00002') AND RC.SalesEmpGUID = SSE.SalesEmpGUID  )\
+                                                                              INNER JOIN	salesprofiledata.SEP_SalesEmpType EmpType     \
+                                                                              ON	EmpType.SalesEmpTypegUID=SSE.SalesEmpTypeGUID  \
+                                                                              AND EmpType.Active = 1  \
+                                                                              \
+                                                  \
+                                                                        UNION ALL\
+                                                                        \
+                                                                        \
+                                                                          SELECT PDC.RetailStorePricingGUID\
+                                                                               , PDC.CurrentPrice\
+                                                                               , PDC.NotInDistribution\
+                                                                               , PDC.CreateDate\
+                                                                               , PDC.UpdateDate\
+                                                                               , PDC.Createuser\
+                                                                               , PDC.Updateuser\
+                                                                               , PDC.CurrentAllowances\
+                                                                               , PDC.Active\
+                                                                               , RC.UserDefinedcallDate\
+                                                                               , RC.CallDate\
+                                                                               , CTYP.CallTypeCode\
+                                                                               , COALESCE(RC.ApplicationID,1) ApplicationID\
+                                                                               ,SalesEmpTypeDescription\
+                                                                               ,PDC.RetailStoreCallGUID\
+                                                                            FROM PDC_VT PDC \
+                                                                            JOIN salesprofiledata.SEP_RetailstoreCall RC  \
+                                                                              ON RC.RetailStoreCallGUID = PDC.RetailStoreCallGUID\
+                                                                             AND RC.Active = 1\
+                                                                            \
+                                                                            JOIN salesprofiledata.SEP_CallType CTYP \
+                                                                              ON CTYP.CallTypeGUID = RC.CallTypeGUID\
+                                                                              INNER JOIN	salesprofiledata.SEP_SalesEmp SSE  ON  1=1\
+                                                                                          AND ( \
+                                                                                                  ( CTYP.CallTypeCode IN ('00003') AND  REPLACE(SSE.DomainUserName, 'PMUSA\', '') = REPLACE(RC.CreateUser, 'PMUSA\', '') )\
+                                                                                              )\
+                                                                                              AND SSE.Active = 1  \
+                                                                              INNER JOIN	salesprofiledata.SEP_SalesEmpType EmpType     \
+                                                                                              ON	EmpType.SalesEmpTypegUID=SSE.SalesEmpTypeGUID  \
+                                                                                                  AND EmpType.Active = 1  \
+                                                                                      \
+                                                                          ) PDC \
+                                                                              ON	RSP.RetailStorePricingGUID = PDC.RetailStorePricingGUID\
+                                                              WHERE  NOT  EXISTS  \
+                                                                          (	SELECT	 1\
+                                                                                                      FROM	 RS_EXT_ATT_VT EA \
+                                                                                                      WHERE	EA.RetailstoreGUID = RSP.RetailstoreGUID\
+                                                                                                              AND EA.Scan_CompanyObjectDescription = RSP.CategoryName\
+                                                                                                              AND EA.Scan_OpCoDesc = RSP.COMPANYNAME\
+                                                                                                              AND EA.SALESCYCLECODE=RSP.SALESCYCLECODE\
+                                                                                                  )")
+
+# COMMAND ----------
+
+CATMAN_RETAILSTOREPRICING_SOURCE_VT = CATMAN_RETAILSTOREPRICING_SOURCE_VT1.unionAll(CATMAN_RETAILSTOREPRICING_SOURCE_VT2)
+
+# COMMAND ----------
+
+CATMAN_RETAILSTOREPRICING_SOURCE_VT.createOrReplaceTempView('CATMAN_RETAILSTOREPRICING_SOURCE_VT')
+
+# COMMAND ----------
+
+CATMAN_RTL_STR_PRICING_WRK_S = spark.sql("SELECT  \
+            IL.RSP_RetailStorePricingGUID RetailStorePricingGUID         \
+		,	IL.RSP_SalesCycleCalendarGUID  SalesCycleGUID                \
+		,	IL.DRV_SalesCycleCode SalesCycleCode                \
+        	,	IL.RSP_RetailStoreGUID  RetailStoreGUID               \
+		,       '0000'||IL.RSP_AccountNumber Accountnumber                 \
+		,	IL.RSP_BrandCompanyObjectGUID BrandCompanyObjectGUID        	\
+		,	IL.RSP_DisplayText  DisplayText                   \
+		,	IL.RSP_CompanyName CompanyName                    \
+		,	IL.RSP_CategoryName CategoryName                   \
+		,	IL.RSP_LeadershipPrice LeadershipPrice               \
+		,	COALESCE(IL.PDC_CurrentPrice , IL.RSP_CurrentPrice  ) CurrentPrice                  \
+		,	IL.RSP_CurrentTotalEligibleAllowances CurrentTotalEligibleAllowances \
+		,	IL.RSP_CurrentTotalAcceptedAllowances CurrentTotalAcceptedAllowances\
+		,	COALESCE(IL.PDC_NotInDistribution,IL.RSP_NotInDistribution ) NotInDistribution              \
+		,	COALESCE(IL.PDC_CreateDate , IL.RSP_CreateDate ) as CreateDate\
+		,	COALESCE(IL.PDC_UpdateDate , IL.RSP_UpdateDate ) as UpdateDate\
+		,	COALESCE(IL.PDC_Createuser , IL.RSP_Createuser ) as CreateUser\
+		,	COALESCE(IL.PDC_Updateuser , IL.RSP_Updateuser ) as UpdateUser\
+		,	COALESCE(IL.PDC_Active	  , IL.RSP_Active     ) as Active\
+		,	CASE WHEN IL.PDC_RetailStorePricingGUID IS NOT NULL THEN 'DataCapture' ELSE 'RetailStorePricing' END as SOURCE\
+		,	 COALESCE(IL.RC_UserDefinedcallDate, IL.RC_CallDate) as  DataCapture_CallDate\
+		,    CASE WHEN IL.PDC_RetailStorePricingGUID IS NOT NULL THEN 1 ELSE 0 END as IsExistsinDataCapture\
+        ,   IL.RSP_Display Display                       \
+		,	IL.IsScanCapture IsScanCapture                 \
+		,	IL.ScanCallDate ScanCallDate                  \
+	  ,IL.ApplicationID  as InputSource\
+	  , IL.SalesEmpTypeDescription as UserCategory\
+      from(\
+                                         select  * \
+      ,ROW_NUMBER() OVER (PARTITION BY RSP_SalesCycleCalendarGUID, RSP_RetailStoreGUID, RSP_BrandCompanyObjectGUID ORDER BY  COALESCE(PDC_UpdateDate,RSP_UpdateDate)  DESC) as Row_Num\
+	FROM CATMAN_RETAILSTOREPRICING_SOURCE_VT)IL\
+	where Row_Num  = 1")
+
+# COMMAND ----------
+
+dbutils.fs.rm("/mnt/ADLS_Reporting/Catman/Catman_Rtl_Str_Pricing_Wrk_S/",True)
+
+CATMAN_RTL_STR_PRICING_WRK_S.write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", True).parquet("/mnt/ADLS_Reporting/Catman/Catman_Rtl_Str_Pricing_Wrk_S/")
+
+# COMMAND ----------
+
+# DBTITLE 1,Catman_Rtl_Str_Pricing
+SCC_VT = spark.sql(" SELECT \
+                      SALES_CYCLE_CD\
+                      FROM \
+                      (\
+                      SELECT \
+                      SALES_CYCLE_CD,\
+                      RANK() OVER (ORDER BY SALES_CYCLE_BEGIN_DT DESC) AS RNK\
+                      FROM \
+                      (\
+                      SELECT \
+                      SALES_CYCLE_CD , \
+                      SALES_CYCLE_BEGIN_DT\
+                      FROM CATMAN.SALES_CYCLE_PRD \
+                      GROUP BY 1, 2\
+                      ) A\
+                      WHERE CURRENT_DATE >= SALES_CYCLE_BEGIN_DT \
+                      ) B\
+                      WHERE RNK =5")
+
+# COMMAND ----------
+
+SCC_VT.createOrReplaceTempView("SCC_VT")
+
+# COMMAND ----------
+
+MAX_SalesCycleCode = spark.sql("SELECT	MAX(SalesCycleCode) FROM catman.CATMAN_RTL_STR_PRICING_WRK_S").collect()[0][0]
+
+# COMMAND ----------
+
+CTE = spark.sql("\
+SELECT DISTINCT SC.SALES_CYCLE_CD ,SC.SALES_CYCLE_BEGIN_DT , SC.SALES_CYCLE_END_DT ,\
+		DENSE_RANK() OVER(\
+ORDER	BY SALES_CYCLE_BEGIN_DT ASC) RNO  \
+ FROM CATMAN.SALES_CYCLE_PRD SC CROSS JOIN SCC_VT\
+ WHERE   SC.SALES_CYCLE_CD BETWEEN SCC_VT.SALES_CYCLE_CD   AND ( '{}')".format(MAX_SalesCycleCode))
+
+# COMMAND ----------
+
+CTE.createOrReplaceTempView("CTE")
+
+# COMMAND ----------
+
+SCC_PRIOR_VT = spark.sql("SELECT CTE.SALES_CYCLE_CD , C.SALES_CYCLE_CD AS Prior_SC ,c.SALES_CYCLE_BEGIN_DT Prior_StartDate ,\
+		c.SALES_CYCLE_END_DT Prior_EndDate  \
+ FROM CTE CTE  \
+ INNER JOIN CTE C \
+ ON C.RNO BETWEEN CTE.RNO-3  AND CTE.RNO \
+ INNER JOIN (\
+SELECT	SALES_CYCLE_CD \
+FROM	catman.SALES_CYCLE_PRD  \
+GROUP	BY SALES_CYCLE_CD ) AS DRV \
+ ON 1=1  \
+ AND  DRV.SALES_CYCLE_CD = CTE.SALES_CYCLE_CD   \
+ GROUP BY  CTE.SALES_CYCLE_CD , C.SALES_CYCLE_CD  ,c.SALES_CYCLE_BEGIN_DT, c.SALES_CYCLE_END_DT ")
+  
+
+# COMMAND ----------
+
+SCC_PRIOR_VT.createOrReplaceTempView("SCC_PRIOR_VT")
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view STORE_NOT_FROM_PDC_VT as 
+# MAGIC  SELECT  
+# MAGIC A.RETAILSTOREGUID, 
+# MAGIC A.BRANDCOMPANYOBJECTGUID,
+# MAGIC A.DISPLAYTEXT,
+# MAGIC A. SALESCYCLEGUID,
+# MAGIC A.SALESCYCLECODE, 
+# MAGIC SCC.PRIOR_SC
+# MAGIC FROM	
+# MAGIC catman.CATMAN_RTL_STR_PRICING_WRK_S A
+# MAGIC JOIN 
+# MAGIC (
+# MAGIC SELECT	A.SALES_CYCLE_CD, MIN(PRIOR_SC) AS PRIOR_SC 
+# MAGIC FROM	SCC_PRIOR_VT A inner join SCC_VT
+# MAGIC on	A.SALES_CYCLE_CD >= SCC_VT.SALES_CYCLE_CD
+# MAGIC GROUP	BY 1
+# MAGIC ) SCC
+# MAGIC 	ON	A.SALESCYCLECODE=SCC.SALES_CYCLE_CD 
+# MAGIC WHERE	A.IsExistsinDataCapture=0
+# MAGIC  AND 
+# MAGIC  A.ACTIVE=1
+# MAGIC  AND A.CURRENTPRICE>'0.01'
+# MAGIC   
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view STORE_FROM_PDC_VT as
+# MAGIC SELECT	DISTINCT
+# MAGIC A.RETAILSTOREGUID, 
+# MAGIC A.BRANDCOMPANYOBJECTGUID,
+# MAGIC A.DISPLAYTEXT, 
+# MAGIC A. SALESCYCLECALENDARGUID AS SALESCYCLEGUID, 
+# MAGIC C.SALESCYCLECODE,
+# MAGIC A.RETAILSTOREPRICINGGUID
+# MAGIC FROM	SEP_RETAILSTOREPRICING A
+# MAGIC JOIN salesprofiledata.SEP_SALESCYCLECALENDAR C
+# MAGIC 	ON	A.SALESCYCLECALENDARGUID=C.SALESCYCLECALENDARGUID
+# MAGIC JOIN salesprofiledata.SEP_RETAILSTOREPRICINGDATACAPTURE B
+# MAGIC 	ON	A.RETAILSTOREPRICINGGUID= B.RETAILSTOREPRICINGGUID
+# MAGIC 	AND	A.ACTIVE=1
+# MAGIC 	AND	B.ACTIVE=1
+# MAGIC JOIN (SELECT DISTINCT SALES_CYCLE_CD FROM SCC_PRIOR_VT) D
+# MAGIC ON C.SALESCYCLECODE=D.SALES_CYCLE_CD
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view THREECYCLES_VT as 
+# MAGIC SELECT 
+# MAGIC A.RETAILSTOREGUID, 
+# MAGIC A.BRANDCOMPANYOBJECTGUID,
+# MAGIC A.DISPLAYTEXT,
+# MAGIC A.SALESCYCLECODE,
+# MAGIC A.SALESCYCLEGUID,
+# MAGIC B.RETAILSTOREPRICINGGUID
+# MAGIC FROM	 STORE_NOT_FROM_PDC_VT A
+# MAGIC LEFT OUTER JOIN 
+# MAGIC STORE_FROM_PDC_VT B
+# MAGIC 	ON	A.RETAILSTOREGUID=B.RETAILSTOREGUID
+# MAGIC 	AND	A.BRANDCOMPANYOBJECTGUID=B.BRANDCOMPANYOBJECTGUID
+# MAGIC 	AND	B.SALESCYCLECODE BETWEEN A.PRIOR_SC AND A.SALESCYCLECODE  
+# MAGIC WHERE	B.RETAILSTOREPRICINGGUID IS NULL
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view SALESEMP_VT_STG  as
+# MAGIC SELECT 
+# MAGIC 	'0000'||ACCOUNTNUMBER AS RC_NUM, 
+# MAGIC 	A.RETAILSTOREGUID, 
+# MAGIC 	CALLDATE, 
+# MAGIC 	A.UPDATEDATE,
+# MAGIC 	CALLTYPEDESCRIPTION, 
+# MAGIC 	SALES_CYCLE_CD, 
+# MAGIC      FIRSTNAME || ' ' || 
+# MAGIC     CASE 
+# MAGIC 	WHEN	MIDDLENAME IS NULL THEN '' 
+# MAGIC ELSE	MIDDLENAME 
+# MAGIC END	|| ' ' || LASTNAME AS EMP_NAME, 
+# MAGIC     TITLE as EMP_TITLE_CD
+# MAGIC 	FROM salesprofiledata.SEP_RETAILSTORECALL A
+# MAGIC 	LEFT OUTER JOIN salesprofiledata.SEP_SALESEMP B
+# MAGIC 	ON A.SALESEMPGUID=B.SALESEMPGUID
+# MAGIC 	JOIN salesprofiledata.SEP_CALLTYPE C
+# MAGIC 	ON A.CALLTYPEGUID=C.CALLTYPEGUID
+# MAGIC 	JOIN catman.SALES_CYCLE_PRD SCC
+# MAGIC 	ON CALLDATE BETWEEN SALES_CYCLE_BEGIN_DT AND SALES_CYCLE_END_DT
+# MAGIC 	JOIN salesprofiledata.SEP_RETAILSTORE RS
+# MAGIC 	ON A.RETAILSTOREGUID=RS.RETAILSTOREGUID
+# MAGIC 	WHERE FIRSTNAME NOT IN ('TEST')
+# MAGIC 	AND C.CALLTYPECODE IN ('00001','00002')
+# MAGIC      AND SALES_CYCLE_CD IN (
+# MAGIC SELECT	DISTINCT SALESCYCLECODE 
+# MAGIC FROM	catman.CATMAN_RTL_STR_PRICING_WRK_S)
+# MAGIC 
+# MAGIC 
+# MAGIC UNION
+# MAGIC 
+# MAGIC SELECT 
+# MAGIC 	'0000'||ACCOUNTNUMBER AS RC_NUM, 
+# MAGIC 	A.RETAILSTOREGUID, 
+# MAGIC 	CALLDATE, 
+# MAGIC 	A.UPDATEDATE,
+# MAGIC 	CALLTYPEDESCRIPTION, 
+# MAGIC 	SALES_CYCLE_CD, 
+# MAGIC     EMP_NAME,
+# MAGIC     EXTR.TITLE as EMP_TITLE_CD
+# MAGIC 	FROM salesprofiledata.SEP_RETAILSTORECALL A
+# MAGIC 	LEFT OUTER JOIN salesprofiledata.SEP_SALESEMP B
+# MAGIC 	ON A.SALESEMPGUID=B.SALESEMPGUID
+# MAGIC 		JOIN salesprofiledata.SEP_CALLTYPE C
+# MAGIC 	ON A.CALLTYPEGUID=C.CALLTYPEGUID
+# MAGIC 	LEFT OUTER JOIN 
+# MAGIC 	(
+# MAGIC 	SELECT replace(SSE.DomainUserName, 'PMUSA\\', '') as USERNM
+# MAGIC 		,CASE WHEN SalesEmpTypeDescription = 'EXTERNAL' THEN 1  ELSE 2 END as EmpTypeDescription
+# MAGIC 		, SSE.SalesEmpGUID
+# MAGIC 		, SalesEmpTypeCode
+# MAGIC 		,     FIRSTNAME || ' ' || CASE 
+# MAGIC 	WHEN	MIDDLENAME IS NULL THEN '' 
+# MAGIC ELSE	MIDDLENAME 
+# MAGIC END	|| ' ' || LASTNAME AS EMP_NAME
+# MAGIC 		,TITLE
+# MAGIC 		, ROW_NUMBER() OVER (PARTITION BY replace(SSE.DomainUserName, 'PMUSA\\', '' ) ORDER BY (CASE WHEN SalesEmpTypeDescription = 'EXTERNAL' THEN 1  ELSE 2 END) ASC, COALESCE(SSE.FirstName,'') ASC, COALESCE(SSE.LastName,'') ASC) as RNO
+# MAGIC 	FROM salesprofiledata.SEP_SalesEmp SSE 
+# MAGIC 		INNER JOIN	salesprofiledata.SEP_SalesEmpType EmpType 
+# MAGIC 			ON	EmpType.SalesEmpTypegUID = SSE.SalesEmpTypeGUID
+# MAGIC 			) EXTR
+# MAGIC 			ON  A.CREATEUSER=EXTR.USERNM
+# MAGIC 	JOIN catman.SALES_CYCLE_PRD SCC
+# MAGIC 	ON CALLDATE BETWEEN SALES_CYCLE_BEGIN_DT AND SALES_CYCLE_END_DT
+# MAGIC 	JOIN salesprofiledata.SEP_RETAILSTORE RS
+# MAGIC 	ON A.RETAILSTOREGUID=RS.RETAILSTOREGUID
+# MAGIC 	WHERE FIRSTNAME NOT IN ('TEST')
+# MAGIC 	AND C.CALLTYPECODE ='00003'
+# MAGIC      AND SALES_CYCLE_CD IN (
+# MAGIC SELECT	DISTINCT SALESCYCLECODE 
+# MAGIC FROM	 catman.CATMAN_RTL_STR_PRICING_WRK_S
+# MAGIC )
+# MAGIC    
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC Create or replace temp view SALESEMP_VT
+# MAGIC as
+# MAGIC select inn.* from 
+# MAGIC (select SALESEMP_VT_STG.*,
+# MAGIC ROW_NUMBER() OVER(PARTITION BY Sales_Cycle_cd,RC_NUM ORDER BY UPDATEDATE DESC, EMP_NAME ASC)  as row_num
+# MAGIC from SALESEMP_VT_STG)inn
+# MAGIC where inn.row_num =1
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view ZIPISSUE_VT  as
+# MAGIC SELECT	POSTAL_CODE, COUNT(DISTINCT STATE) as CNT 
+# MAGIC FROM	catman.CATMAN_STORE_DIMENSION 
+# MAGIC GROUP	BY 1
+# MAGIC HAVING	CNT>1
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view CATMAN_RTL_STR_PRICING_S as
+# MAGIC SELECT	
+# MAGIC A.RetailStorePricingGUID
+# MAGIC  ,A.RETAILSTOREGUID 
+# MAGIC ,A.SALESCYCLEGUID
+# MAGIC ,A.BRANDCOMPANYOBJECTGUID
+# MAGIC ,B.RC_NUM
+# MAGIC ,A.SALESCYCLECODE
+# MAGIC ,A.DISPLAYTEXT
+# MAGIC ,CO.LEVEL7DESCRIPTION as BRAND_LVL_7
+# MAGIC ,A.CompanyName
+# MAGIC ,A.LeadershipPrice
+# MAGIC ,A.CurrentPrice
+# MAGIC ,A.CurrentTotalEligibleAllowances
+# MAGIC ,A.CurrentTotalAcceptedAllowances 
+# MAGIC ,CASE	  
+# MAGIC 								WHEN B.State = 'Not Available' THEN 0
+# MAGIC 								WHEN A.NotInDistribution = 1 THEN 0
+# MAGIC 								WHEN COALESCE(A.CurrentPrice,0.01) <= 0.01 THEN 0    
+# MAGIC 								WHEN C.POSTAL_CODE IS NOT NULL THEN 0  			
+# MAGIC 								WHEN PriorCall.RetailStoreGUID IS Not NULL THEN 0 
+# MAGIC 								
+# MAGIC 
+# MAGIC 								
+# MAGIC 								
+# MAGIC 								
+# MAGIC 		WHEN (A.CurrentPrice + 
+# MAGIC 														CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances 
+# MAGIC 														END	) < CCL.EFF_LCL  THEN 0 		
+# MAGIC 		WHEN (A.CurrentPrice + 
+# MAGIC 														CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances 
+# MAGIC 														END	) > CCL.EFF_UCL  THEN 0			
+# MAGIC 						
+# MAGIC 		WHEN (A.CurrentPrice + 
+# MAGIC 														CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances 
+# MAGIC 														END	) <  SCL.EFF_LCL  THEN 0
+# MAGIC 														
+# MAGIC 		WHEN (A.CurrentPrice + 
+# MAGIC 														CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances 
+# MAGIC 														END	) > SCL.EFF_UCL  THEN 0		
+# MAGIC 							  	ELSE 1
+# MAGIC END  AS IsValidForAvgPricing
+# MAGIC ,CASE	WHEN B.State = 'Not Available' 
+# MAGIC 			THEN 'Store Address Issue.' 
+# MAGIC 						
+# MAGIC 						WHEN A.NotInDistribution = 1 
+# MAGIC 						THEN 'Brand Not In Distribution'  
+# MAGIC 									
+# MAGIC 									WHEN COALESCE(A.CurrentPrice,0.01) <= 0.01 
+# MAGIC 									THEN 'Price Not Captured'  
+# MAGIC 												
+# MAGIC 												WHEN C.POSTAL_CODE IS NOT NULL 
+# MAGIC 							 					THEN  'Store Address Issue'  
+# MAGIC 						
+# MAGIC 		WHEN PriorCall.RetailStoreGUID IS Not NULL THEN 'Price Not Captured In Last 3 Sales Cycles' 
+# MAGIC 
+# MAGIC 
+# MAGIC 		WHEN (A.CurrentPrice + 
+# MAGIC 														CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances 
+# MAGIC 														END	) < CCL.EFF_LCL  THEN 'Price Lower Than Allowed Minimum'  		
+# MAGIC 		WHEN (A.CurrentPrice + 
+# MAGIC 														CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances 
+# MAGIC 														END	) > CCL.EFF_UCL  THEN 'Price Greater Than Allowed Maximum'  			
+# MAGIC 						
+# MAGIC 		WHEN (A.CurrentPrice + 
+# MAGIC 														CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances 
+# MAGIC 														END	) <  SCL.EFF_LCL  THEN 'Price Lower Than Allowed Minimum' 
+# MAGIC 														
+# MAGIC 		WHEN (A.CurrentPrice + 
+# MAGIC 														CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances 
+# MAGIC 														END	) > SCL.EFF_UCL  THEN 'Price Greater Than Allowed Maximum'  	
+# MAGIC 																		
+# MAGIC 							  							ELSE 'Price Ok'
+# MAGIC  END AS REASON
+# MAGIC ,LC.EMP_NAME AS LastCallBy
+# MAGIC ,LC.EMP_TITLE_CD
+# MAGIC ,LC.CALLDATE
+# MAGIC ,A.CATEGORYNAME       
+# MAGIC ,A.NotInDistribution
+# MAGIC , A.CreateDate
+# MAGIC , A.UpdateDate
+# MAGIC , A.CreateUser
+# MAGIC , A.UpdateUser
+# MAGIC , A.Active
+# MAGIC , A.SOURCE
+# MAGIC , A.DataCapture_CallDate
+# MAGIC , A.IsExistsinDataCapture
+# MAGIC , A.Display
+# MAGIC , A.IsScanCapture
+# MAGIC , A.ScanCallDate
+# MAGIC , A.InputSource
+# MAGIC , A.UserCategory
+# MAGIC FROM	Catman.CATMAN_RTL_STR_PRICING_WRK_S A
+# MAGIC JOIN Catman.CATMAN_STORE_DIMENSION_ALL B
+# MAGIC 	ON	A.ACCOUNTNUMBER=B.RC_NUM 
+# MAGIC 	AND A.ACTIVE=1
+# MAGIC JOIN Catman.SALES_CYCLE_PRD SCC
+# MAGIC 	ON SCC.SALES_CYCLE_CD=A.SALESCYCLECODE
+# MAGIC 
+# MAGIC JOIN Catman.CATMAN_SER_DIM_COMPANYOBJECT CO
+# MAGIC 	ON CO.COMPANYOBJECTGUID = A.BRANDCOMPANYOBJECTGUID
+# MAGIC LEFT OUTER JOIN ZIPISSUE_VT C
+# MAGIC 	ON	B.POSTAL_CODE=C.POSTAL_CODE
+# MAGIC 	
+# MAGIC LEFT OUTER JOIN Catman.CATMAN_PRICE_THRESHOLD SCL	
+# MAGIC  ON SCL.STATE=B.STATE
+# MAGIC  AND SCL.SALES_CYCLE_CD=A.SALESCYCLECODE
+# MAGIC  AND SCL.BRAND=A.DISPLAYTEXT
+# MAGIC  AND SCL.FIPS_COUNTY_CD IS NULL
+# MAGIC  
+# MAGIC LEFT OUTER JOIN Catman.CATMAN_PRICE_THRESHOLD CCL	
+# MAGIC  ON CCL.STATE=B.STATE
+# MAGIC  AND B.FIPS_COUNTY_CD=CCL.FIPS_COUNTY_CD
+# MAGIC  AND CCL.SALES_CYCLE_CD=A.SALESCYCLECODE
+# MAGIC  AND CCL.BRAND=A.DISPLAYTEXT
+# MAGIC 
+# MAGIC 	
+# MAGIC LEFT OUTER JOIN SALESEMP_VT LC
+# MAGIC 		ON LC.RETAILSTOREGUID=A.RETAILSTOREGUID
+# MAGIC 		AND LC.SALES_CYCLE_CD=A.SALESCYCLECODE
+# MAGIC 
+# MAGIC 
+# MAGIC LEFT OUTER JOIN THREECYCLES_VT PriorCall
+# MAGIC       ON    PriorCall.SalesCycleCode   = A.SalesCycleCode  
+# MAGIC       AND PriorCall.SalesCycleGUID   = A.SalesCycleGUID   
+# MAGIC       AND PriorCall.RetailStoreGUID   = A.RetailStoreGUID  
+# MAGIC       AND PriorCall.BrandCompanyObjectGUID = A.BrandCompanyObjectGUID  
+# MAGIC       AND PriorCall.DisplayText    = A.DisplayText        
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view MAXSCC_VT as
+# MAGIC select * from
+# MAGIC (SELECT SALES_CYCLE_CD,RANK() OVER (ORDER BY SALES_CYCLE_BEGIN_DT DESC) as Rnk  FROM catman.SALES_CYCLE_PRD
+# MAGIC WHERE CURRENT_DATE >=SALES_CYCLE_END_DT)
+# MAGIC where Rnk  =37
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view Catman_Rtl_Str_Pricing_stage as 
+# MAGIC SELECT
+# MAGIC RetailStorePricingGUID, 
+# MAGIC RETAILSTOREGUID, 
+# MAGIC SALESCYCLEGUID, 
+# MAGIC BRANDCOMPANYOBJECTGUID, 
+# MAGIC RC_NUM, 
+# MAGIC SALESCYCLECODE, 
+# MAGIC DISPLAYTEXT, 
+# MAGIC BRAND_LVL_7,
+# MAGIC CompanyName, 
+# MAGIC LeadershipPrice, 
+# MAGIC CurrentPrice, 
+# MAGIC CurrentTotalEligibleAllowances, 
+# MAGIC CurrentTotalAcceptedAllowances, 
+# MAGIC IsValidForAvgPricing, 
+# MAGIC Reason,  
+# MAGIC LastCallBy, 
+# MAGIC EMP_TITLE_CD, 
+# MAGIC CALLDATE, 
+# MAGIC CATEGORYNAME, 
+# MAGIC NotInDistribution, 
+# MAGIC CreateDate, 
+# MAGIC UpdateDate, 
+# MAGIC CreateUser, 
+# MAGIC UpdateUser, 
+# MAGIC Active, 
+# MAGIC SOURCE, 
+# MAGIC DataCapture_CallDate, 
+# MAGIC IsExistsinDataCapture, 
+# MAGIC Display, 
+# MAGIC IsScanCapture, 
+# MAGIC ScanCallDate, 
+# MAGIC InputSource, 
+# MAGIC UserCategory
+# MAGIC 	FROM CATMAN_RTL_STR_PRICING_S
+# MAGIC 		MINUS
+# MAGIC 	SELECT
+# MAGIC RetailStorePricingGUID, 
+# MAGIC RETAILSTOREGUID, 
+# MAGIC SALESCYCLEGUID, 
+# MAGIC BRANDCOMPANYOBJECTGUID, 
+# MAGIC RC_NUM, 
+# MAGIC SALESCYCLECODE, 
+# MAGIC DISPLAYTEXT, 
+# MAGIC BRAND_LVL_7,
+# MAGIC CompanyName, 
+# MAGIC LeadershipPrice, 
+# MAGIC CurrentPrice, 
+# MAGIC CurrentTotalEligibleAllowances, 
+# MAGIC CurrentTotalAcceptedAllowances, 
+# MAGIC IsValidForAvgPricing, 
+# MAGIC Reason, 
+# MAGIC LastCallBy, 
+# MAGIC EMP_TITLE_CD, 
+# MAGIC CALLDATE, 
+# MAGIC CATEGORYNAME, 
+# MAGIC NotInDistribution, 
+# MAGIC CreateDate, 
+# MAGIC UpdateDate, 
+# MAGIC CreateUser, 
+# MAGIC UpdateUser, 
+# MAGIC Active, 
+# MAGIC SOURCE, 
+# MAGIC DataCapture_CallDate, 
+# MAGIC IsExistsinDataCapture, 
+# MAGIC Display, 
+# MAGIC IsScanCapture, 
+# MAGIC ScanCallDate, 
+# MAGIC InputSource, 
+# MAGIC UserCategory
+# MAGIC 	FROM catman.Catman_Rtl_Str_Pricing_Stg 
+# MAGIC    inner join  MAXSCC_VT on SALESCYCLECODE > MAXSCC_VT.SALES_CYCLE_CD
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view Catman_Rtl_Str_Pricing_T as 
+# MAGIC select 
+# MAGIC coalesce(UPD_REC.RetailStorePricingGUID, SRC.RetailStorePricingGUID )RetailStorePricingGUID, 
+# MAGIC SRC.RETAILSTOREGUID,
+# MAGIC SRC.SALESCYCLEGUID, 
+# MAGIC SRC.BRANDCOMPANYOBJECTGUID, 
+# MAGIC coalesce(UPD_REC.RC_NUM,SRC.RC_NUM)RC_NUM, 
+# MAGIC SRC.SALESCYCLECODE, 
+# MAGIC initcap(upper(coalesce(UPD_REC.DISPLAYTEXT, SRC.DISPLAYTEXT)))DISPLAYTEXT, 
+# MAGIC coalesce(UPD_REC.BRAND_LVL_7,SRC.BRAND_LVL_7)BRAND_LVL_7,
+# MAGIC coalesce(UPD_REC.CompanyName, SRC.CompanyName)CompanyName, 
+# MAGIC coalesce(UPD_REC.LeadershipPrice ,SRC.LeadershipPrice)LeadershipPrice, 
+# MAGIC coalesce(UPD_REC.CurrentPrice, SRC.CurrentPrice)CurrentPrice, 
+# MAGIC coalesce(UPD_REC.CurrentTotalEligibleAllowances, SRC.CurrentTotalEligibleAllowances)CurrentTotalEligibleAllowances, 
+# MAGIC coalesce(UPD_REC.CurrentTotalAcceptedAllowances, SRC.CurrentTotalAcceptedAllowances)CurrentTotalAcceptedAllowances, 
+# MAGIC coalesce(UPD_REC.IsValidForAvgPricing, SRC.IsValidForAvgPricing)IsValidForAvgPricing, 
+# MAGIC coalesce(UPD_REC.Reason, SRC.Reason)Reason, 
+# MAGIC 'NULL' AS ExceptionReason,
+# MAGIC coalesce(UPD_REC.LastCallBy, SRC.LastCallBy)LastCallBy, 
+# MAGIC coalesce(UPD_REC.EMP_TITLE_CD, SRC.EMP_TITLE_CD)EMP_TITLE_CD, 
+# MAGIC coalesce(UPD_REC.CALLDATE, SRC.CALLDATE)CALLDATE, 
+# MAGIC coalesce(UPD_REC.CATEGORYNAME, SRC.CATEGORYNAME)CATEGORYNAME, 
+# MAGIC coalesce(UPD_REC.NotInDistribution, SRC.NotInDistribution)NotInDistribution, 
+# MAGIC coalesce(UPD_REC.CreateDate, SRC.CreateDate)CreateDate, 
+# MAGIC coalesce(UPD_REC.UpdateDate, SRC.UpdateDate)UpdateDate, 
+# MAGIC coalesce(UPD_REC.CreateUser, SRC.CreateUser)CreateUser, 
+# MAGIC coalesce(UPD_REC.UpdateUser, SRC.UpdateUser)UpdateUser, 
+# MAGIC coalesce(UPD_REC.Active, SRC.Active)Active, 
+# MAGIC coalesce(UPD_REC.SOURCE, SRC.SOURCE)SOURCE, 
+# MAGIC coalesce(UPD_REC.DataCapture_CallDate, SRC.DataCapture_CallDate)DataCapture_CallDate, 
+# MAGIC coalesce(UPD_REC.IsExistsinDataCapture, SRC.IsExistsinDataCapture)IsExistsinDataCapture, 
+# MAGIC coalesce(UPD_REC.Display, SRC.Display)Display, 
+# MAGIC coalesce(UPD_REC.IsScanCapture, SRC.IsScanCapture)IsScanCapture, 
+# MAGIC coalesce(UPD_REC.ScanCallDate, SRC.ScanCallDate)ScanCallDate, 
+# MAGIC coalesce(UPD_REC.InputSource, SRC.InputSource)InputSource, 
+# MAGIC coalesce(UPD_REC.UserCategory,SRC.UserCategory)UserCategory,
+# MAGIC SRC.Ins_Ts,
+# MAGIC case when UPD_REC.RetailStoreGUID is null then SRC.Updt_Ts else CURRENT_TIMESTAMP end as Updt_Ts ,
+# MAGIC 'SDF' as SRC_SYS_CD
+# MAGIC 
+# MAGIC from catman.Catman_Rtl_Str_Pricing_Stg SRC
+# MAGIC inner join  MAXSCC_VT on SRC.SALESCYCLECODE > MAXSCC_VT.SALES_CYCLE_CD
+# MAGIC left join Catman_Rtl_Str_Pricing_stage UPD_REC  
+# MAGIC ON 
+# MAGIC     SRC.RetailStoreGUID = UPD_REC.RetailStoreGUID
+# MAGIC AND SRC.SalesCycleGUID = UPD_REC.SalesCycleGUID
+# MAGIC AND SRC.BrandCompanyObjectGUID=UPD_REC.BrandCompanyObjectGUID
+# MAGIC AND SRC.SALESCYCLECODE=UPD_REC.SALESCYCLECODE
+# MAGIC 
+# MAGIC UNION ALL
+# MAGIC 
+# MAGIC select 
+# MAGIC UPD_REC.RetailStorePricingGUID, 
+# MAGIC UPD_REC.RETAILSTOREGUID, 
+# MAGIC UPD_REC.SALESCYCLEGUID, 
+# MAGIC UPD_REC.BRANDCOMPANYOBJECTGUID, 
+# MAGIC UPD_REC.RC_NUM, 
+# MAGIC UPD_REC.SALESCYCLECODE, 
+# MAGIC initcap(upper(UPD_REC.DISPLAYTEXT)) as DISPLAYTEXT , 
+# MAGIC UPD_REC.BRAND_LVL_7,
+# MAGIC UPD_REC.CompanyName, 
+# MAGIC UPD_REC.LeadershipPrice, 
+# MAGIC UPD_REC.CurrentPrice, 
+# MAGIC UPD_REC.CurrentTotalEligibleAllowances, 
+# MAGIC UPD_REC.CurrentTotalAcceptedAllowances, 
+# MAGIC UPD_REC.IsValidForAvgPricing, 
+# MAGIC UPD_REC.Reason, 
+# MAGIC 'NULL' AS ExceptionReason,
+# MAGIC UPD_REC.LastCallBy, 
+# MAGIC UPD_REC.EMP_TITLE_CD, 
+# MAGIC UPD_REC.CALLDATE, 
+# MAGIC UPD_REC.CATEGORYNAME, 
+# MAGIC UPD_REC.NotInDistribution, 
+# MAGIC UPD_REC.CreateDate, 
+# MAGIC UPD_REC.UpdateDate, 
+# MAGIC UPD_REC.CreateUser, 
+# MAGIC UPD_REC.UpdateUser, 
+# MAGIC UPD_REC.Active, 
+# MAGIC UPD_REC.SOURCE, 
+# MAGIC UPD_REC.DataCapture_CallDate, 
+# MAGIC UPD_REC.IsExistsinDataCapture, 
+# MAGIC UPD_REC.Display, 
+# MAGIC UPD_REC.IsScanCapture, 
+# MAGIC UPD_REC.ScanCallDate, 
+# MAGIC UPD_REC.InputSource, 
+# MAGIC UPD_REC.UserCategory,
+# MAGIC CURRENT_TIMESTAMP as Ins_Ts ,
+# MAGIC CURRENT_TIMESTAMP as Updt_Ts ,
+# MAGIC 'SDF' as SRC_SYS_CD
+# MAGIC 
+# MAGIC from Catman_Rtl_Str_Pricing_stage UPD_REC left anti join catman.Catman_Rtl_Str_Pricing_Stg SRC
+# MAGIC ON 
+# MAGIC     SRC.RetailStoreGUID = UPD_REC.RetailStoreGUID
+# MAGIC AND SRC.SalesCycleGUID = UPD_REC.SalesCycleGUID
+# MAGIC AND SRC.BrandCompanyObjectGUID=UPD_REC.BrandCompanyObjectGUID
+# MAGIC AND SRC.SALESCYCLECODE=UPD_REC.SALESCYCLECODE
+
+# COMMAND ----------
+
+src_path = "/mnt/ADLS_Staging/Catman/Catman_Rtl_Str_Pricing_Stg/"
+tgt_path = "/mnt/ADLS_Reporting/Catman/Catman_Rtl_Str_Pricing_Stg/"
+
+dbutils.fs.rm(src_path,True) 
+
+spark.sql("select * from Catman_Rtl_Str_Pricing_T").write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", True).parquet(src_path)
+
+dbutils.fs.rm(tgt_path,True) 
+dbutils.fs.mv(src_path,tgt_path,True)
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view Catman_Rtl_Str_Pricing_V as 
+# MAGIC 	SELECT
+# MAGIC RC_NUM, 
+# MAGIC SALESCYCLECODE, 
+# MAGIC DISPLAYTEXT, 
+# MAGIC BRAND_LVL_7,
+# MAGIC CompanyName, 
+# MAGIC LeadershipPrice, 
+# MAGIC CurrentPrice, 
+# MAGIC CurrentTotalEligibleAllowances, 
+# MAGIC CurrentTotalAcceptedAllowances, 
+# MAGIC IsValidForAvgPricing, 
+# MAGIC Reason,  
+# MAGIC ExceptionReason,
+# MAGIC CATEGORYNAME, 
+# MAGIC LastCallBy, 
+# MAGIC EMP_TITLE_CD, 
+# MAGIC CALLDATE, 
+# MAGIC NotInDistribution, 
+# MAGIC Display, 
+# MAGIC SOURCE, 
+# MAGIC IsExistsinDataCapture, 
+# MAGIC DataCapture_CallDate, 
+# MAGIC IsScanCapture, 
+# MAGIC ScanCallDate, 
+# MAGIC CreateUser, 
+# MAGIC UpdateUser, 
+# MAGIC CreateDate, 
+# MAGIC UpdateDate, 
+# MAGIC InputSource, 
+# MAGIC UserCategory,
+# MAGIC Active
+# MAGIC 	FROM Catman.Catman_Rtl_Str_Pricing_Stg
+
+# COMMAND ----------
+
+dbutils.fs.rm("/mnt/ADLS_Reporting/Catman/Catman_Rtl_Str_Pricing/",True)
+
+spark.sql("select * from Catman_Rtl_Str_Pricing_V").write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", True).parquet("/mnt/ADLS_Reporting/Catman/Catman_Rtl_Str_Pricing/")
+
+# COMMAND ----------
+
+dbutils.fs.rm("/mnt/ADLS_Staging/SQLMI/CATMAN/Catman_Rtl_Str_Pricing/",True) 
+spark.sql("select * from Catman.Catman_Rtl_Str_Pricing").coalesce(15).write.option("emptyValue","").option("delimiter",'|').option("treatEmptyValuesAsNulls", False).option("nullValue", 'NULL').mode('overwrite').csv("/mnt/ADLS_Staging/SQLMI/CATMAN/Catman_Rtl_Str_Pricing/")
+
+# COMMAND ----------
+
+# DBTITLE 1,Catman_St_Prc_Threshold
+# MAGIC %sql
+# MAGIC create or replace temp view SCC_VT as
+# MAGIC SELECT 
+# MAGIC SALES_CYCLE_CD
+# MAGIC FROM 
+# MAGIC (
+# MAGIC SELECT 
+# MAGIC SALES_CYCLE_CD,
+# MAGIC RANK() OVER (ORDER BY SALES_CYCLE_BEGIN_DT DESC) AS RNK
+# MAGIC FROM 
+# MAGIC (
+# MAGIC SELECT 
+# MAGIC SALES_CYCLE_CD , 
+# MAGIC SALES_CYCLE_BEGIN_DT
+# MAGIC FROM catman.SALES_CYCLE_PRD 
+# MAGIC GROUP BY 1, 2
+# MAGIC ) A
+# MAGIC WHERE CURRENT_DATE >= SALES_CYCLE_BEGIN_DT 
+# MAGIC ) B
+# MAGIC WHERE RNK =2
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view RECORDS_VT as 
+# MAGIC SELECT 
+# MAGIC B.STATE, 
+# MAGIC A.DISPLAYTEXT, 
+# MAGIC A.COMPANYNAME,
+# MAGIC A.CATEGORYNAME,
+# MAGIC A.SALESCYCLECODE,
+# MAGIC D.SALES_CYCLE_BEGIN_DT as EFFECTIVE_DT,
+# MAGIC D.SALES_CYCLE_END_DT as TERMINATION_DT,
+# MAGIC MEAN AS SYS_MEAN_PRICE, 
+# MAGIC CAST(SQRT(AVG(power(((A.CurrentPrice +  (CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances END )
+# MAGIC )  - MEAN),2))) AS decimal(10,2)) as STD ,
+# MAGIC MEAN - 6 * (CAST(SQRT(AVG(power(((A.CurrentPrice +  (CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances END )
+# MAGIC )  - MEAN),2))) AS decimal(10,2))) as LCL,
+# MAGIC MEAN + 6 * (CAST(SQRT(AVG(power(((A.CurrentPrice +  (CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances END )
+# MAGIC )  - MEAN),2))) AS decimal(10,2))) as UCL
+# MAGIC FROM Catman.CATMAN_RTL_STR_PRICING A 
+# MAGIC JOIN Catman.CATMAN_STORE_DIMENSION B
+# MAGIC ON B.RC_NUM=A.RC_NUM
+# MAGIC JOIN Catman.SALES_CYCLE_PRD D
+# MAGIC ON A.SALESCYCLECODE=D.SALES_CYCLE_CD
+# MAGIC JOIN 
+# MAGIC (
+# MAGIC SELECT DISTINCT  
+# MAGIC STATE, 
+# MAGIC SALESCYCLECODE, 
+# MAGIC DISPLAYTEXT, 
+# MAGIC COUNT(*) OVER(PARTITION BY STATE, DISPLAYTEXT, SALESCYCLECODE) AS CNT , 
+# MAGIC AVG(CURRENTPRICE + (CASE	WHEN A.CompanyName='Competitor' 
+# MAGIC 														THEN A.CurrentTotalAcceptedAllowances 
+# MAGIC 														ELSE A.CurrentTotalEligibleAllowances END )) OVER (PARTITION BY STATE, DISPLAYTEXT, SALESCYCLECODE) AS MEAN
+# MAGIC FROM Catman.CATMAN_RTL_STR_PRICING A
+# MAGIC JOIN Catman.CATMAN_STORE_DIMENSION B
+# MAGIC ON B.RC_NUM=A.RC_NUM
+# MAGIC INNER JOIN SCC_VT
+# MAGIC ON SALESCYCLECODE >= SCC_VT.SALES_CYCLE_CD 
+# MAGIC AND CURRENTPRICE>0.01
+# MAGIC ) C
+# MAGIC ON A.DISPLAYTEXT=C.DISPLAYTEXT
+# MAGIC AND B.STATE=C.STATE
+# MAGIC AND C.SALESCYCLECODE=A.SALESCYCLECODE
+# MAGIC INNER JOIN SCC_VT
+# MAGIC ON A.SALESCYCLECODE>= SCC_VT.SALES_CYCLE_CD 
+# MAGIC AND A.CURRENTPRICE>0.01
+# MAGIC AND B.STATE <> 'PR'
+# MAGIC GROUP BY 1,2,3,4,5,6,7,8
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view MAX_VT as
+# MAGIC SELECT STATE, initcap(upper(DISPLAYTEXT)) DISPLAYTEXT, MAX(SALESCYCLECODE) as SALESCYCLECODE FROM RECORDS_VT
+# MAGIC GROUP BY 1,2
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view UPDT_TERM_VT as 
+# MAGIC SELECT STATE, initcap(upper(BRAND)) BRAND, SALESCYCLECODE, TERMINATION_DT, B.SALES_CYCLE_END_DT FROM 
+# MAGIC (
+# MAGIC SELECT STATE, initcap(upper(BRAND)) BRAND,MIN(SALES_CYCLE_CD) SALESCYCLECODE, TERMINATION_DT FROM Catman.CATMAN_ST_PRC_THRESHOLD 
+# MAGIC WHERE (STATE, initcap(upper(BRAND)) BRAND) IN (SELECT STATE, DISPLAYTEXT FROM MAX_VT) 
+# MAGIC AND 
+# MAGIC TERMINATION_DT = '9999-12-31'
+# MAGIC GROUP BY 1,2,4
+# MAGIC ) A
+# MAGIC JOIN Catman.SALES_CYCLE_PRD B
+# MAGIC ON A.SALESCYCLECODE = B.SALES_CYCLE_CD
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view CATMAN_ST_PRC_THRESHOLD_Src as 
+# MAGIC select STPCTD.STATE,initcap(upper(STPCTD.BRAND))BRAND,STPCTD.SALES_CYCLE_CD,
+# MAGIC        STPCTD.MFGR_ACRONYM,STPCTD.CATEGORY_NAME,STPCTD.LOWER_CONTROL_LIMIT,
+# MAGIC        STPCTD.UPPER_CONTROL_LIMIT,STPCTD.SYS_MEAN_PRICE,STPCTD.EFFECTIVE_DT,coalesce(UPDT.SALES_CYCLE_END_DT,STPCTD.TERMINATION_DT) as TERMINATION_DT
+# MAGIC      from Catman.CATMAN_ST_PRC_THRESHOLD STPCTD left join  UPDT_TERM_VT UPDT on 
+# MAGIC      STPCTD.STATE = UPDT.STATE
+# MAGIC      AND STPCTD.BRAND = UPDT.BRAND
+# MAGIC      AND STPCTD.SALES_CYCLE_CD = UPDT.SALESCYCLECODE
+# MAGIC      AND STPCTD.TERMINATION_DT ='9999-12-31'
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view RECORDS_VT_T as
+# MAGIC select R.STATE, 
+# MAGIC initcap(upper(R.DISPLAYTEXT)) as DISPLAYTEXT, 
+# MAGIC R.SALESCYCLECODE, 
+# MAGIC COMPANYNAME,
+# MAGIC CATEGORYNAME, 
+# MAGIC LCL, 
+# MAGIC UCL, 
+# MAGIC SYS_MEAN_PRICE, 
+# MAGIC EFFECTIVE_DT, 
+# MAGIC case when M.STATE is not null and M.DISPLAYTEXT is not null and  M.SALESCYCLECODE is not null then '9999-12-31' else  TERMINATION_DT end as TERMINATION_DT
+# MAGIC FROM RECORDS_VT R left join MAX_VT M on
+# MAGIC R.STATE = M.STATE and
+# MAGIC R.DISPLAYTEXT = M.DISPLAYTEXT and
+# MAGIC R.SALESCYCLECODE = M.SALESCYCLECODE
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view CATMAN_ST_PRC_THRESHOLD_Stg as 
+# MAGIC SELECT 
+# MAGIC STATE, 
+# MAGIC DISPLAYTEXT, 
+# MAGIC SALESCYCLECODE, 
+# MAGIC COMPANYNAME,
+# MAGIC CATEGORYNAME, 
+# MAGIC LCL, 
+# MAGIC UCL, 
+# MAGIC SYS_MEAN_PRICE, 
+# MAGIC EFFECTIVE_DT, 
+# MAGIC TERMINATION_DT
+# MAGIC FROM RECORDS_VT
+# MAGIC MINUS 
+# MAGIC SELECT 
+# MAGIC STATE, 
+# MAGIC BRAND, 
+# MAGIC SALES_CYCLE_CD, 
+# MAGIC MFGR_ACRONYM, 
+# MAGIC CATEGORY_NAME, 
+# MAGIC LOWER_CONTROL_LIMIT, 
+# MAGIC UPPER_CONTROL_LIMIT, 
+# MAGIC SYS_MEAN_PRICE, 
+# MAGIC EFFECTIVE_DT, 
+# MAGIC TERMINATION_DT
+# MAGIC FROM CATMAN_ST_PRC_THRESHOLD_Src
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create or replace temp view CATMAN_ST_PRC_THRESHOLD_TGT as
+# MAGIC select 
+# MAGIC SRC.STATE,
+# MAGIC SRC.BRAND,
+# MAGIC SRC.SALES_CYCLE_CD,
+# MAGIC coalesce(UPD_REC.COMPANYNAME,SRC.MFGR_ACRONYM) MFGR_ACRONYM, 
+# MAGIC coalesce(UPD_REC.CATEGORYNAME, SRC.CATEGORY_NAME) CATEGORY_NAME,
+# MAGIC coalesce(UPD_REC.LCL, SRC.LOWER_CONTROL_LIMIT) LOWER_CONTROL_LIMIT,
+# MAGIC coalesce(UPD_REC.UCL, SRC.UPPER_CONTROL_LIMIT) UPPER_CONTROL_LIMIT,
+# MAGIC coalesce(UPD_REC.SYS_MEAN_PRICE, SRC.SYS_MEAN_PRICE) SYS_MEAN_PRICE,
+# MAGIC coalesce(UPD_REC.EFFECTIVE_DT, SRC.EFFECTIVE_DT) EFFECTIVE_DT,
+# MAGIC coalesce(UPD_REC.TERMINATION_DT,SRC.TERMINATION_DT)TERMINATION_DT
+# MAGIC 
+# MAGIC from 
+# MAGIC CATMAN_ST_PRC_THRESHOLD_Src SRC
+# MAGIC left join CATMAN_ST_PRC_THRESHOLD_Stg UPD_REC
+# MAGIC on SRC.STATE=UPD_REC.STATE
+# MAGIC AND SRC.BRAND=UPD_REC.DISPLAYTEXT
+# MAGIC AND SRC.SALES_CYCLE_CD=UPD_REC.SALESCYCLECODE
+# MAGIC 
+# MAGIC UNION ALL
+# MAGIC 
+# MAGIC select
+# MAGIC UPD_REC.STATE, 
+# MAGIC UPD_REC.DISPLAYTEXT as BRAND, 
+# MAGIC UPD_REC.SALESCYCLECODE as SALES_CYCLE_CD, 
+# MAGIC UPD_REC.COMPANYNAME as MFGR_ACRONYM,
+# MAGIC UPD_REC.CATEGORYNAME as CATEGORY_NAME, 
+# MAGIC UPD_REC.LCL as LOWER_CONTROL_LIMIT, 
+# MAGIC UPD_REC.UCL as UPPER_CONTROL_LIMIT, 
+# MAGIC UPD_REC.SYS_MEAN_PRICE, 
+# MAGIC UPD_REC.EFFECTIVE_DT, 
+# MAGIC UPD_REC.TERMINATION_DT
+# MAGIC from 
+# MAGIC CATMAN_ST_PRC_THRESHOLD_Stg UPD_REC
+# MAGIC left anti join CATMAN_ST_PRC_THRESHOLD_Src SRC
+# MAGIC on SRC.STATE=UPD_REC.STATE
+# MAGIC AND SRC.BRAND=UPD_REC.DISPLAYTEXT
+# MAGIC AND SRC.SALES_CYCLE_CD=UPD_REC.SALESCYCLECODE
+
+# COMMAND ----------
+
+src_path = "/mnt/ADLS_Staging/Catman/Catman_St_Prc_Threshold/"
+tgt_path = "/mnt/ADLS_Reporting/Catman/Catman_St_Prc_Threshold/"
+
+dbutils.fs.rm(src_path,True)
+
+spark.sql("select * from CATMAN_ST_PRC_THRESHOLD_TGT").write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", True).parquet(src_path)
+
+dbutils.fs.rm(tgt_path,True) 
+dbutils.fs.mv(src_path,tgt_path,True)
+
+# COMMAND ----------
+
+dbutils.fs.rm("/mnt/ADLS_Staging/SQLMI/CATMAN/Catman_St_Prc_Threshold/",True) 
+spark.sql("select * from Catman.Catman_St_Prc_Threshold").coalesce(15).write.option("emptyValue","").option("delimiter",'|').option("treatEmptyValuesAsNulls", False).option("nullValue", 'NULL').mode('overwrite').csv("/mnt/ADLS_Staging/SQLMI/CATMAN/Catman_St_Prc_Threshold/")
+
+# COMMAND ----------
+
+# DBTITLE 1,Catman_Price_Threshold
+# MAGIC %sql
+# MAGIC create or replace temp view Catman_Price_Threshold as 
+# MAGIC SELECT 
+# MAGIC   STATE,
+# MAGIC   FIPS_COUNTY_CD,
+# MAGIC   BRAND,
+# MAGIC   PT.SALES_CYCLE_CD,
+# MAGIC   MFGR_ACRONYM,
+# MAGIC   CATEGORY_NAME,
+# MAGIC   SYS_MEAN_PRICE,
+# MAGIC   CASE WHEN SCC.SALES_CYCLE_CD IS NULL THEN NULL ELSE SYS_LCL END AS SYS_LCL,
+# MAGIC   CASE WHEN SCC.SALES_CYCLE_CD IS NULL THEN NULL ELSE SYS_UCL END AS SYS_UCL,
+# MAGIC   OVRD_LCL,
+# MAGIC   OVRD_UCL,
+# MAGIC   CASE WHEN (OVRD_LCL IS NULL OR OVRD_LCL = '?') THEN CASE WHEN SCC.SALES_CYCLE_CD IS NULL THEN NULL ELSE SYS_LCL END ELSE OVRD_LCL END AS EFF_LCL,
+# MAGIC   CASE WHEN (OVRD_UCL IS NULL OR OVRD_UCL = '?') THEN CASE WHEN SCC.SALES_CYCLE_CD IS NULL THEN NULL ELSE SYS_UCL END ELSE OVRD_UCL END AS EFF_UCL,
+# MAGIC   OVRD_LVL,
+# MAGIC   EFFECTIVE_DT AS OVRD_EFF_DT,
+# MAGIC   TERMINATION_DT AS OVRD_END_DT
+# MAGIC   FROM 
+# MAGIC   (
+# MAGIC   SELECT 
+# MAGIC   PT.STATE,
+# MAGIC   Cast(NULL AS CHAR(5)) AS FIPS_COUNTY_CD, 
+# MAGIC   PT.BRAND, 
+# MAGIC   SCP.SALES_CYCLE_CD,
+# MAGIC   PT.MFGR_ACRONYM, 
+# MAGIC   PT.CATEGORY_NAME, 
+# MAGIC   PT.SYS_MEAN_PRICE, 
+# MAGIC   PT.LOWER_CONTROL_LIMIT AS SYS_LCL,
+# MAGIC   PT.UPPER_CONTROL_LIMIT AS SYS_UCL,
+# MAGIC   OVR.LOWER_CONTROL_LIMIT  AS OVRD_LCL,
+# MAGIC   OVR.UPPER_CONTROL_LIMIT AS OVRD_UCL,
+# MAGIC   CASE WHEN OVR.LOWER_CONTROL_LIMIT IS NOT NULL THEN 'STATE'
+# MAGIC   			WHEN OVR.UPPER_CONTROL_LIMIT IS NOT NULL THEN 'STATE'
+# MAGIC   			ELSE NULL END AS OVRD_LVL,
+# MAGIC   			 OVR.EFFECTIVE_DT,
+# MAGIC   OVR.TERMINATION_DT
+# MAGIC   FROM Catman.CATMAN_ST_PRC_THRESHOLD PT
+# MAGIC   JOIN Catman.SALES_CYCLE_PRD SCP
+# MAGIC   ON SCP.SALES_CYCLE_END_DT BETWEEN PT.EFFECTIVE_DT AND PT.TERMINATION_DT
+# MAGIC   AND SCP.SALES_CYCLE_CD<>'999912'
+# MAGIC   LEFT OUTER JOIN 
+# MAGIC   Catman.SLF_SRV_CATMAN_ST_PRC_OVRD OVR
+# MAGIC   ON PT.STATE=OVR.STATE
+# MAGIC   AND PT.BRAND=OVR.BRAND
+# MAGIC   AND   SCP.SALES_CYCLE_END_DT  BETWEEN OVR.EFFECTIVE_DT AND OVR.TERMINATION_DT
+# MAGIC   
+# MAGIC   
+# MAGIC   UNION
+# MAGIC   
+# MAGIC   SELECT 
+# MAGIC   OVR.STATE, 
+# MAGIC   OVR.FIPS_COUNTY_CD,
+# MAGIC   OVR.BRAND, 
+# MAGIC   SCP.SALES_CYCLE_CD,
+# MAGIC   SPT.MFGR_ACRONYM,
+# MAGIC   SPT.CATEGORY_NAME,
+# MAGIC   SPT.SYS_MEAN_PRICE, 
+# MAGIC   SPT.LOWER_CONTROL_LIMIT, 
+# MAGIC   SPT.UPPER_CONTROL_LIMIT,
+# MAGIC   OVR.LOWER_CONTROL_LIMIT, 
+# MAGIC   OVR.UPPER_CONTROL_LIMIT,
+# MAGIC   'CNTY',
+# MAGIC    OVR.EFFECTIVE_DT, 
+# MAGIC   OVR.TERMINATION_DT
+# MAGIC   FROM Catman.SLF_SRV_CATMAN_CNTY_PRC_OVRD OVR
+# MAGIC   JOIN 
+# MAGIC   Catman.SALES_CYCLE_PRD SCP
+# MAGIC   ON SCP.SALES_CYCLE_END_DT BETWEEN OVR.EFFECTIVE_DT AND OVR.TERMINATION_DT
+# MAGIC   JOIN Catman.CATMAN_ST_PRC_THRESHOLD SPT
+# MAGIC   ON SPT.STATE=OVR.STATE
+# MAGIC   AND SPT.BRAND=OVR.BRAND
+# MAGIC   AND SCP.SALES_CYCLE_END_DT BETWEEN SPT.EFFECTIVE_DT AND SPT.TERMINATION_DT
+# MAGIC   WHERE SCP.SALES_CYCLE_CD <>'999912'
+# MAGIC   ) PT
+# MAGIC   LEFT OUTER JOIN
+# MAGIC   (SELECT SALES_CYCLE_CD FROM Catman.SALES_CYCLE_PRD WHERE Current_Date > SALES_CYCLE_BEGIN_DT) SCC
+# MAGIC   ON PT.SALES_CYCLE_CD=SCC.SALES_CYCLE_CD
+
+# COMMAND ----------
+
+dbutils.fs.rm("/mnt/ADLS_Reporting/Catman/Catman_Price_Threshold/",True)
+
+spark.sql("select * from Catman_Price_Threshold").write.option("emptyValue","").option("quote", "\u0000").option("delimiter", '|').option("header", True).parquet("/mnt/ADLS_Reporting/Catman/Catman_Price_Threshold/")
+
+# COMMAND ----------
+
+dbutils.fs.rm("/mnt/ADLS_Staging/SQLMI/CATMAN/Catman_Price_Threshold/",True) 
+spark.sql("select * from Catman.Catman_Price_Threshold").write.option("emptyValue","").option("delimiter",'|').option("treatEmptyValuesAsNulls", False).option("nullValue", 'NULL').mode('overwrite').csv("/mnt/ADLS_Staging/SQLMI/CATMAN/Catman_Price_Threshold/")
+
+# COMMAND ----------
+
+
